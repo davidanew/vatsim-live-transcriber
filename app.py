@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import base64
 from collections import deque
-import getpass
 import json
 import os
 from pathlib import Path
@@ -11,7 +10,7 @@ import re
 import sys
 import threading
 from datetime import datetime
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 
@@ -22,14 +21,26 @@ REALTIME_URL = "wss://api.openai.com/v1/realtime?intent=transcription"
 TRANSCRIPTION_MODEL = "gpt-live-transcribe"
 SAMPLE_RATE = 24_000
 FRAMES_PER_CHUNK = 2_400  # 100 ms
-TERMINAL_GREEN = "\033[32m"
-TERMINAL_RESET = "\033[0m"
 DEFAULT_PROMPT = (
     "English VATSIM air traffic control radio communications. Transcribe aviation "
     "phraseology exactly. Preserve callsigns, runway identifiers, headings, altitudes, "
     "flight levels, frequencies, squawk codes, waypoint names, registrations, and "
     "clearances. Do not invent missing speech."
 )
+
+
+class TranscriptEventSink(Protocol):
+    """Thread-safe destination for transcription and connection events."""
+
+    def connected(self) -> None: ...
+
+    def delta(self, item_id: str, text: str) -> None: ...
+
+    def completed(self, item_id: str, original: str, converted: str) -> None: ...
+
+    def error(self, message: str) -> None: ...
+
+    def stopped(self, message: str) -> None: ...
 
 # Spoken-number aliases include common ICAO pronunciations. The API often
 # returns these as words, so finalized transcripts are normalized locally.
@@ -225,16 +236,6 @@ def transcript_variants(raw_transcript: str) -> list[str]:
     return [original, normalized]
 
 
-def green_terminal_line(text: str) -> str:
-    """Wrap one terminal line in ANSI green without affecting transcript logs."""
-    return f"{TERMINAL_GREEN}{text}{TERMINAL_RESET}"
-
-
-def detection_terminal_line(text: str) -> str:
-    """Prefix the original text for a newly detected radio transmission."""
-    return f"> {text.lstrip()}"
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Live VATSIM/system-audio transcription with gpt-live-transcribe."
@@ -401,52 +402,340 @@ class LocalVad:
 
 
 def choose_device(devices: list[Any], requested: str | None) -> Any:
+    """Resolve a command-line device number or partial name."""
     if not devices:
         raise RuntimeError(
             "No WASAPI loopback devices were found. Check that Windows has an enabled "
             "audio output device."
         )
 
-    if requested:
-        if requested.isdigit():
-            index = int(requested)
-            if 1 <= index <= len(devices):
-                return devices[index - 1]
-            raise ValueError(f"Device number must be between 1 and {len(devices)}.")
+    if not requested:
+        raise ValueError("No device was selected.")
+    if requested.isdigit():
+        index = int(requested)
+        if 1 <= index <= len(devices):
+            return devices[index - 1]
+        raise ValueError(f"Device number must be between 1 and {len(devices)}.")
 
-        matches = [
-            device for device in devices if requested.casefold() in device.name.casefold()
-        ]
-        if len(matches) == 1:
-            return matches[0]
-        if not matches:
-            raise ValueError(f"No loopback device contains {requested!r}.")
-        raise ValueError(f"More than one loopback device contains {requested!r}.")
-
-    print("\nWindows output devices:")
-    for index, device in enumerate(devices, start=1):
-        print(f"  {index}. {device.name}")
-
-    while True:
-        value = input(f"Choose device [1-{len(devices)}]: ").strip()
-        if value.isdigit() and 1 <= int(value) <= len(devices):
-            return devices[int(value) - 1]
-        print("Enter one of the displayed numbers.")
+    matches = [
+        device for device in devices if requested.casefold() in device.name.casefold()
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise ValueError(f"No loopback device contains {requested!r}.")
+    raise ValueError(f"More than one loopback device contains {requested!r}.")
 
 
-def choose_channel(requested: str | None) -> str:
-    if requested:
-        return requested
-    print("\nAudio channel:")
-    print("  1. Left")
-    print("  2. Right")
-    print("  3. Mix both channels")
-    mapping = {"1": "left", "2": "right", "3": "mix"}
-    while True:
-        value = input("Choose channel [1-3]: ").strip()
-        if value in mapping:
-            return mapping[value]
-        print("Enter 1, 2, or 3.")
+def show_startup_dialog(
+    *,
+    devices: list[Any],
+    selected_device: Any | None,
+    channel: str | None,
+    accuracy: str,
+    api_key: str,
+) -> tuple[Any, str, str, str] | None:
+    """Collect missing startup settings in a modal GUI dialog."""
+    from PySide6.QtWidgets import (
+        QComboBox,
+        QDialog,
+        QDialogButtonBox,
+        QFormLayout,
+        QLabel,
+        QLineEdit,
+        QVBoxLayout,
+    )
+
+    dialog = QDialog()
+    dialog.setWindowTitle("VATSIM Live Transcriber")
+    dialog.setMinimumWidth(560)
+    layout = QVBoxLayout(dialog)
+    title = QLabel("Start live transcription")
+    title.setStyleSheet("font-size: 18px; font-weight: 600; margin-bottom: 8px;")
+    layout.addWidget(title)
+    form = QFormLayout()
+    layout.addLayout(form)
+
+    device_box = QComboBox()
+    device_box.addItems([device.name for device in devices])
+    initial_index = 0
+    if selected_device is not None:
+        initial_index = next(
+            (
+                index
+                for index, device in enumerate(devices)
+                if device is selected_device
+            ),
+            0,
+        )
+    device_box.setCurrentIndex(initial_index)
+    form.addRow("Audio device", device_box)
+
+    channel_box = QComboBox()
+    channel_box.addItems(["left", "right", "mix"])
+    channel_box.setCurrentText(channel or "left")
+    form.addRow("Channel", channel_box)
+
+    accuracy_box = QComboBox()
+    accuracy_box.addItems(["minimal", "low", "medium", "high", "xhigh"])
+    accuracy_box.setCurrentText(accuracy)
+    form.addRow("Accuracy", accuracy_box)
+
+    key_entry = QLineEdit(api_key)
+    key_entry.setEchoMode(QLineEdit.EchoMode.Password)
+    form.addRow("OpenAI API key", key_entry)
+
+    message = QLabel()
+    message.setStyleSheet("color: #ef4444;")
+    layout.addWidget(message)
+
+    def start() -> None:
+        key = key_entry.text().strip()
+        if not key:
+            message.setText("An OpenAI API key is required.")
+            key_entry.setFocus()
+            return
+        dialog.accept()
+
+    buttons = QDialogButtonBox(
+        QDialogButtonBox.StandardButton.Cancel
+        | QDialogButtonBox.StandardButton.Ok
+    )
+    buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Start")
+    buttons.accepted.connect(start)
+    buttons.rejected.connect(dialog.reject)
+    layout.addWidget(buttons)
+    key_entry.setFocus()
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return None
+    return (
+        devices[device_box.currentIndex()],
+        channel_box.currentText(),
+        accuracy_box.currentText(),
+        key_entry.text().strip(),
+    )
+
+
+def create_transcript_window(
+    *,
+    device_name: str,
+    channel: str,
+    accuracy: str,
+    output_path: Path,
+) -> Any:
+    """Create the Qt transcript window and its thread-safe event signals."""
+    from PySide6.QtCore import Qt, Signal, Slot
+    from PySide6.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
+    from PySide6.QtWidgets import (
+        QHBoxLayout,
+        QLabel,
+        QMainWindow,
+        QPlainTextEdit,
+        QPushButton,
+        QVBoxLayout,
+        QWidget,
+    )
+
+    class TranscriptWindow(QMainWindow):
+        connected_signal = Signal()
+        delta_signal = Signal(str, str)
+        completed_signal = Signal(str, str, str)
+        error_signal = Signal(str)
+        stopped_signal = Signal(str)
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.live_cursors: dict[str, QTextCursor] = {}
+            self.start_callback: Any | None = None
+            self.stop_callback: Any | None = None
+            self.setWindowTitle("VATSIM Live Transcriber")
+            self.resize(1000, 650)
+            self.setMinimumSize(650, 380)
+
+            central = QWidget()
+            self.setCentralWidget(central)
+            layout = QVBoxLayout(central)
+            layout.setContentsMargins(18, 16, 18, 12)
+            layout.setSpacing(10)
+
+            title = QLabel("VATSIM Live Transcriber")
+            title.setStyleSheet("font-size: 20px; font-weight: 650;")
+            layout.addWidget(title)
+            details = QLabel(
+                f"{device_name}  |  {channel.title()}  |  "
+                f"{accuracy.title()} accuracy"
+            )
+            details.setStyleSheet("color: #9ca3af;")
+            layout.addWidget(details)
+
+            toolbar = QHBoxLayout()
+            self.status = QLabel("Ready - press Start")
+            self.status.setStyleSheet("color: #9ca3af; font-weight: 600;")
+            toolbar.addWidget(self.status)
+            toolbar.addStretch()
+            clear_button = QPushButton("Clear")
+            clear_button.clicked.connect(self._clear)
+            toolbar.addWidget(clear_button)
+            self.start_button = QPushButton("Start")
+            self.start_button.clicked.connect(self._request_start)
+            toolbar.addWidget(self.start_button)
+            self.stop_button = QPushButton("Stop")
+            self.stop_button.clicked.connect(self._request_stop)
+            self.stop_button.setEnabled(False)
+            toolbar.addWidget(self.stop_button)
+            layout.addLayout(toolbar)
+
+            self.text = QPlainTextEdit()
+            self.text.setReadOnly(True)
+            self.text.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+            self.text.setFont(QFont("Consolas", 13))
+            self.text.setStyleSheet(
+                "QPlainTextEdit {"
+                "background: #030712; color: #f3f4f6; border: 1px solid #1f2937;"
+                "padding: 12px; selection-background-color: #374151;"
+                "}"
+            )
+            layout.addWidget(self.text, 1)
+
+            path_label = QLabel(f"Transcript: {output_path}")
+            path_label.setStyleSheet("color: #6b7280;")
+            layout.addWidget(path_label)
+
+            self.original_format = QTextCharFormat()
+            self.original_format.setForeground(QColor("#f3f4f6"))
+            self.converted_format = QTextCharFormat()
+            self.converted_format.setForeground(QColor("#22c55e"))
+
+            self.setStyleSheet(
+                "QMainWindow, QWidget { background: #0b1220; color: #f9fafb; }"
+                "QPushButton { background: #1f2937; border: 1px solid #374151;"
+                "padding: 6px 14px; border-radius: 4px; }"
+                "QPushButton:hover { background: #374151; }"
+            )
+
+            queued = Qt.ConnectionType.QueuedConnection
+            self.connected_signal.connect(self._connected, queued)
+            self.delta_signal.connect(self._show_delta, queued)
+            self.completed_signal.connect(self._show_completed, queued)
+            self.error_signal.connect(self._show_error, queued)
+            self.stopped_signal.connect(self._show_stopped, queued)
+
+        def set_session_callbacks(
+            self, start_callback: Any, stop_callback: Any
+        ) -> None:
+            self.start_callback = start_callback
+            self.stop_callback = stop_callback
+
+        # Emitting Qt signals is safe from the WebSocket worker thread. Qt
+        # queues each update for execution on the GUI thread.
+        def connected(self) -> None:
+            self.connected_signal.emit()
+
+        def delta(self, item_id: str, text: str) -> None:
+            self.delta_signal.emit(item_id, text)
+
+        def completed(
+            self, item_id: str, original: str, converted: str
+        ) -> None:
+            self.completed_signal.emit(item_id, original, converted)
+
+        def error(self, message: str) -> None:
+            self.error_signal.emit(message)
+
+        def stopped(self, message: str) -> None:
+            self.stopped_signal.emit(message)
+
+        @Slot()
+        def _connected(self) -> None:
+            self.status.setText("Connected - waiting for radio audio")
+            self.status.setStyleSheet("color: #22c55e; font-weight: 600;")
+            self.start_button.setEnabled(False)
+            self.stop_button.setEnabled(True)
+
+        def _new_live_cursor(self) -> QTextCursor:
+            cursor = self.text.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            if not self.text.document().isEmpty():
+                cursor.insertText("\n", self.original_format)
+            return cursor
+
+        @Slot(str, str)
+        def _show_delta(self, item_id: str, text: str) -> None:
+            cursor = self.live_cursors.pop(item_id, None)
+            if cursor is None:
+                cursor = self._new_live_cursor()
+            else:
+                cursor.removeSelectedText()
+            start = cursor.position()
+            original = text.lstrip()
+            cursor.insertText(f"> {original}\n", self.original_format)
+            cursor.insertText(
+                normalize_spoken_numbers(original),
+                self.converted_format,
+            )
+            end = cursor.position()
+            cursor.setPosition(start)
+            cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+            self.live_cursors[item_id] = cursor
+            self.text.moveCursor(QTextCursor.MoveOperation.End)
+            self.text.ensureCursorVisible()
+
+        @Slot(str, str, str)
+        def _show_completed(
+            self, item_id: str, original: str, converted: str
+        ) -> None:
+            cursor = self.live_cursors.pop(item_id, None)
+            if cursor is None:
+                cursor = self._new_live_cursor()
+            else:
+                cursor.removeSelectedText()
+            cursor.insertText(f"> {original}\n", self.original_format)
+            cursor.insertText(f"{converted}\n", self.converted_format)
+            self.text.moveCursor(QTextCursor.MoveOperation.End)
+            self.text.ensureCursorVisible()
+
+        @Slot()
+        def _clear(self) -> None:
+            self.text.clear()
+            self.live_cursors.clear()
+
+        @Slot()
+        def _request_start(self) -> None:
+            self.status.setText("Connecting...")
+            self.status.setStyleSheet("color: #fbbf24; font-weight: 600;")
+            self.start_button.setEnabled(False)
+            self.stop_button.setEnabled(True)
+            if self.start_callback is not None:
+                self.start_callback()
+
+        @Slot()
+        def _request_stop(self) -> None:
+            self.status.setText("Stopping...")
+            self.status.setStyleSheet("color: #fbbf24; font-weight: 600;")
+            self.stop_button.setEnabled(False)
+            if self.stop_callback is not None:
+                self.stop_callback()
+
+        @Slot(str)
+        def _show_error(self, message: str) -> None:
+            self.status.setText(message)
+            self.status.setStyleSheet("color: #ef4444; font-weight: 600;")
+            self.start_button.setEnabled(True)
+            self.stop_button.setEnabled(False)
+
+        @Slot(str)
+        def _show_stopped(self, message: str) -> None:
+            self.status.setText(message)
+            self.status.setStyleSheet("color: #9ca3af; font-weight: 600;")
+            self.start_button.setEnabled(True)
+            self.stop_button.setEnabled(False)
+
+        def closeEvent(self, event: Any) -> None:
+            if self.stop_callback is not None:
+                self.stop_callback()
+            super().closeEvent(event)
+
+    return TranscriptWindow()
 
 
 class LiveTranscriber:
@@ -464,6 +753,7 @@ class LiveTranscriber:
         output_path: Path,
         vad_rms: float,
         silence_ms: int,
+        event_sink: TranscriptEventSink,
     ) -> None:
         # Imported lazily so argument/help and unit-test code can load without
         # creating a WebSocket dependency at module import time.
@@ -478,12 +768,15 @@ class LiveTranscriber:
         self.output_path = output_path
         self.vad_rms = vad_rms
         self.silence_ms = silence_ms
+        self.event_sink = event_sink
         # The WebSocket callbacks and audio capture run on separate threads.
         self.connected = threading.Event()
         self.stop_requested = threading.Event()
         self.audio_thread: threading.Thread | None = None
         self.streamed_text_for: dict[str, str] = {}
         self.log_lock = threading.Lock()
+        self.error_reported = False
+        self.stopped_reported = False
 
         # The intent query selects a dedicated transcription session. Passing a
         # Realtime conversation model here creates an incompatible session type.
@@ -524,7 +817,7 @@ class LiveTranscriber:
     def _on_open(self, ws: Any) -> None:
         ws.send(json.dumps(self.session_update()))
         self.connected.set()
-        print("Connected. Waiting for radio audio; press Ctrl+C to stop.\n")
+        self.event_sink.connected()
         # Audio capture would block the WebSocket callback loop, so it runs in a
         # daemon thread and sends events through the shared WebSocket object.
         self.audio_thread = threading.Thread(
@@ -533,6 +826,15 @@ class LiveTranscriber:
             daemon=True,
         )
         self.audio_thread.start()
+
+    def _report_error(self, message: str) -> None:
+        self.error_reported = True
+        self.event_sink.error(message)
+
+    def _report_stopped(self) -> None:
+        if not self.error_reported and not self.stopped_reported:
+            self.stopped_reported = True
+            self.event_sink.stopped("Stopped - press Start to reconnect")
 
     def _capture_audio(self) -> None:
         vad = LocalVad(
@@ -561,7 +863,7 @@ class LiveTranscriber:
                         # A commit asks the model to finalize this radio turn.
                         self.ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
         except Exception as exc:
-            print(f"\nAudio capture failed: {exc}", file=sys.stderr)
+            self._report_error(f"Audio capture failed: {exc}")
             self.stop_requested.set()
             self.ws.close()
 
@@ -569,25 +871,19 @@ class LiveTranscriber:
         try:
             event = json.loads(message)
         except json.JSONDecodeError:
-            print(f"\nUnexpected server message: {message}", file=sys.stderr)
+            self._report_error("The server returned an unreadable message.")
             return
 
         event_type = event.get("type", "")
         if event_type == "conversation.item.input_audio_transcription.delta":
-            # Deltas provide immediate terminal feedback while speech is decoded.
+            # The GUI replaces one live text range as each delta arrives.
             item_id = str(event.get("item_id", ""))
             delta = str(event.get("delta", ""))
             if delta:
                 previous_text = self.streamed_text_for.get(item_id, "")
                 streamed_text = previous_text + delta
                 self.streamed_text_for[item_id] = streamed_text
-                # Each event contains only the new text. Appending that delta
-                # directly keeps one live white line without cursor redrawing.
-                displayed_delta = delta.lstrip() if not previous_text else delta
-                sys.stdout.write(
-                    f"> {displayed_delta}" if not previous_text else displayed_delta
-                )
-                sys.stdout.flush()
+                self.event_sink.delta(item_id, streamed_text)
             return
 
         if event_type == "conversation.item.input_audio_transcription.completed":
@@ -595,20 +891,9 @@ class LiveTranscriber:
             item_id = str(event.get("item_id", ""))
             raw_transcript = str(event.get("transcript", "")).strip()
             variants = transcript_variants(raw_transcript)
-            streamed_text = self.streamed_text_for.pop(item_id, "")
-            if streamed_text:
-                # Finish the live white line, then show the authoritative
-                # number-normalized transcript once in green.
-                sys.stdout.write("\n")
-                if len(variants) > 1:
-                    print(green_terminal_line(variants[1]))
-                sys.stdout.flush()
-            else:
-                # A completed event can occasionally arrive without deltas.
-                if variants:
-                    print(detection_terminal_line(variants[0]))
-                if len(variants) > 1:
-                    print(green_terminal_line(variants[1]))
+            self.streamed_text_for.pop(item_id, "")
+            if variants:
+                self.event_sink.completed(item_id, variants[0], variants[1])
             if variants:
                 timestamp = datetime.now().strftime("%H:%M:%S")
                 with self.log_lock:
@@ -621,51 +906,67 @@ class LiveTranscriber:
         if event_type == "error":
             error = event.get("error", {})
             message_text = error.get("message", json.dumps(event))
-            print(f"\nOpenAI API error: {message_text}", file=sys.stderr)
+            self._report_error(f"OpenAI API error: {message_text}")
             self.stop_requested.set()
             ws.close()
 
     def _on_error(self, ws: Any, error: Any) -> None:
         if not self.stop_requested.is_set():
-            print(f"\nWebSocket error: {error}", file=sys.stderr)
+            self._report_error(f"WebSocket error: {error}")
 
     def _on_close(self, ws: Any, status_code: Any, message: Any) -> None:
         self.stop_requested.set()
         if status_code and status_code != 1000:
-            print(
-                f"\nConnection closed ({status_code}): {message or 'no reason supplied'}",
-                file=sys.stderr,
+            self._report_error(
+                f"Connection closed ({status_code}): "
+                f"{message or 'no reason supplied'}"
             )
+        else:
+            self._report_stopped()
+
+    def stop(self) -> None:
+        """Request a clean stop from the GUI thread."""
+        self.stop_requested.set()
+        self.ws.close()
 
     def run(self) -> None:
-        """Run until Ctrl+C, an API error, or the WebSocket closes."""
+        """Run until the GUI requests a stop or the WebSocket closes."""
         try:
             self.ws.run_forever(ping_interval=20, ping_timeout=10)
-        except KeyboardInterrupt:
-            pass
+        except Exception as exc:
+            if not self.stop_requested.is_set():
+                self._report_error(f"Transcription failed: {exc}")
         finally:
             self.stop_requested.set()
             self.ws.close()
             if self.audio_thread and self.audio_thread.is_alive():
                 self.audio_thread.join(timeout=2)
+            self._report_stopped()
 
 
 def main() -> int:
+    from PySide6.QtWidgets import QApplication, QMessageBox
+
     args = parse_args()
+    application = QApplication(sys.argv)
+    application.setApplicationName("VATSIM Live Transcriber")
+    application.setStyle("Fusion")
+
+    def fail(message: str, code: int = 2) -> int:
+        QMessageBox.critical(None, "VATSIM Live Transcriber", message)
+        return code
+
     if not 0 < args.vad_rms <= 1:
-        print("--vad-rms must be greater than 0 and no greater than 1.", file=sys.stderr)
-        return 2
+        return fail("--vad-rms must be greater than 0 and no greater than 1.")
     if args.silence_ms < 100:
-        print("--silence-ms must be at least 100.", file=sys.stderr)
-        return 2
+        return fail("--silence-ms must be at least 100.")
 
     try:
         # SoundCard exposes Windows playback endpoints as WASAPI loopback
         # microphones, allowing the program to capture CABLE In from vPilot.
         import soundcard as sc
     except ImportError:
-        print("SoundCard is not installed. Run this program through run.ps1.", file=sys.stderr)
-        return 2
+        return fail("SoundCard is not installed. Start the app through run.cmd.")
 
     loopbacks = [
         microphone
@@ -675,28 +976,47 @@ def main() -> int:
 
     if args.list_devices:
         if not loopbacks:
-            print("No WASAPI loopback devices were found.")
-            return 1
-        for index, device in enumerate(loopbacks, start=1):
-            print(f"{index}. {device.name}")
+            return fail("No WASAPI loopback devices were found.", 1)
+        QMessageBox.information(
+            None,
+            "Windows output devices",
+            "\n".join(
+                f"{index}. {device.name}"
+                for index, device in enumerate(loopbacks, start=1)
+            ),
+        )
         return 0
 
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        # getpass keeps a manually entered key out of terminal history and logs.
-        api_key = getpass.getpass("OpenAI API key (not saved): ").strip()
-    if not api_key:
-        print("An OpenAI API key is required.", file=sys.stderr)
-        return 2
+    if not loopbacks:
+        return fail(
+            "No WASAPI loopback devices were found. Check that Windows has an "
+            "enabled audio output device."
+        )
 
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     try:
-        device = choose_device(loopbacks, args.device)
-        channel = choose_channel(args.channel)
+        selected_device = (
+            choose_device(loopbacks, args.device) if args.device else None
+        )
         keywords = load_keywords(args.keywords)
         prompt = load_prompt(args.prompt_file)
     except (OSError, RuntimeError, ValueError) as exc:
-        print(f"Configuration error: {exc}", file=sys.stderr)
-        return 2
+        return fail(f"Configuration error: {exc}")
+
+    channel = args.channel
+    accuracy = args.accuracy
+    if selected_device is None or channel is None or not api_key:
+        settings = show_startup_dialog(
+            devices=loopbacks,
+            selected_device=selected_device,
+            channel=channel,
+            accuracy=accuracy,
+            api_key=api_key,
+        )
+        if settings is None:
+            return 0
+        selected_device, channel, accuracy, api_key = settings
+    device = selected_device
 
     if args.output:
         output_path = args.output.expanduser().resolve()
@@ -709,29 +1029,51 @@ def main() -> int:
         )
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    print("\nVATSIM Live Transcriber")
-    print(f"  Device : {device.name}")
-    print(f"  Channel: {channel}")
-    print(f"  Accuracy: {args.accuracy}")
-    print("  Session type       : transcription")
-    print(f"  Transcription model: {TRANSCRIPTION_MODEL}")
-    print(f"  Log    : {output_path}")
-    print(f"  Keywords: {len(keywords)}")
-
-    transcriber = LiveTranscriber(
-        api_key=api_key,
-        device=device,
+    window = create_transcript_window(
+        device_name=device.name,
         channel=channel,
-        accuracy=args.accuracy,
-        prompt=prompt,
-        keywords=keywords,
+        accuracy=accuracy,
         output_path=output_path,
-        vad_rms=args.vad_rms,
-        silence_ms=args.silence_ms,
     )
-    transcriber.run()
-    print(f"\nStopped. Transcript saved to {output_path}")
-    return 0
+    active_transcriber: LiveTranscriber | None = None
+    active_worker: threading.Thread | None = None
+
+    def start_transcription() -> None:
+        nonlocal active_transcriber, active_worker
+        if active_worker is not None and active_worker.is_alive():
+            window.error("The previous session is still stopping. Try again.")
+            return
+
+        active_transcriber = LiveTranscriber(
+            api_key=api_key,
+            device=device,
+            channel=channel,
+            accuracy=accuracy,
+            prompt=prompt,
+            keywords=keywords,
+            output_path=output_path,
+            vad_rms=args.vad_rms,
+            silence_ms=args.silence_ms,
+            event_sink=window,
+        )
+        active_worker = threading.Thread(
+            target=active_transcriber.run,
+            name="openai-transcription",
+            daemon=True,
+        )
+        active_worker.start()
+
+    def stop_transcription() -> None:
+        if active_transcriber is not None:
+            active_transcriber.stop()
+
+    window.set_session_callbacks(start_transcription, stop_transcription)
+    window.show()
+    exit_code = application.exec()
+    stop_transcription()
+    if active_worker is not None:
+        active_worker.join(timeout=2)
+    return exit_code
 
 
 if __name__ == "__main__":

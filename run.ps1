@@ -9,6 +9,7 @@ $ErrorActionPreference = "Stop"
 $appDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 $venvDirectory = Join-Path $appDirectory ".venv"
 $python = Join-Path $venvDirectory "Scripts\python.exe"
+$pythonw = Join-Path $venvDirectory "Scripts\pythonw.exe"
 
 function Find-Uv {
     # Check PATH first, followed by the common per-user uv install locations.
@@ -60,5 +61,5 @@ if ($LASTEXITCODE -ne 0) {
     throw "Could not install the program dependencies."
 }
 
-& $python (Join-Path $appDirectory "app.py") @AppArguments
+& $pythonw (Join-Path $appDirectory "app.py") @AppArguments
 exit $LASTEXITCODE

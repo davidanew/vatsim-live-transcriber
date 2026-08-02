@@ -3,6 +3,7 @@
 venv/
 __pycache__/
 *.py[cod]
+.uv-cache/
 
 # Generated transcripts and logs
 transcripts/

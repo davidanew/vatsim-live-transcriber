@@ -1,5 +1,3 @@
-from contextlib import redirect_stdout
-from io import StringIO
 import json
 from pathlib import Path
 import tempfile
@@ -12,12 +10,8 @@ from app import (
     LiveTranscriber,
     LocalVad,
     REALTIME_URL,
-    TERMINAL_GREEN,
-    TERMINAL_RESET,
     TRANSCRIPTION_MODEL,
-    detection_terminal_line,
     float_to_pcm16,
-    green_terminal_line,
     normalize_spoken_numbers,
     select_channel,
     transcript_variants,
@@ -113,66 +107,70 @@ class AudioConversionTests(unittest.TestCase):
             ["No spoken numbers", "No spoken numbers"],
         )
 
-    def test_converted_terminal_line_is_green(self):
-        self.assertEqual(
-            green_terminal_line("Speedbird 123"),
-            f"{TERMINAL_GREEN}Speedbird 123{TERMINAL_RESET}",
-        )
+    def test_gui_receives_progressive_text_then_completed_pair(self):
+        class RecordingSink:
+            def __init__(self):
+                self.deltas = []
+                self.completions = []
 
-    def test_detection_line_replaces_leading_space_with_marker(self):
-        self.assertEqual(
-            detection_terminal_line(" Hold short Kilo one."),
-            "> Hold short Kilo one.",
-        )
-        self.assertEqual(
-            detection_terminal_line("Bravo Kilo Hotel"),
-            "> Bravo Kilo Hotel",
-        )
+            def delta(self, item_id, text):
+                self.deltas.append((item_id, text))
 
-    def test_deltas_form_one_white_line_then_one_green_line(self):
+            def completed(self, item_id, original, converted):
+                self.completions.append((item_id, original, converted))
+
         with tempfile.TemporaryDirectory() as temp_dir:
+            sink = RecordingSink()
             transcriber = LiveTranscriber.__new__(LiveTranscriber)
             transcriber.streamed_text_for = {}
             transcriber.log_lock = threading.Lock()
             transcriber.output_path = Path(temp_dir) / "transcript.txt"
+            transcriber.event_sink = sink
 
-            output = StringIO()
-            with redirect_stdout(output):
-                for delta in ("Lufthansa ", "Alpha one"):
-                    transcriber._on_message(
-                        None,
-                        json.dumps(
-                            {
-                                "type": (
-                                    "conversation.item."
-                                    "input_audio_transcription.delta"
-                                ),
-                                "item_id": "radio-turn",
-                                "delta": delta,
-                            }
-                        ),
-                    )
+            for delta in ("Lufthansa ", "Alpha one"):
                 transcriber._on_message(
                     None,
                     json.dumps(
                         {
                             "type": (
                                 "conversation.item."
-                                "input_audio_transcription.completed"
+                                "input_audio_transcription.delta"
                             ),
                             "item_id": "radio-turn",
-                            "transcript": "Lufthansa Alpha one",
+                            "delta": delta,
                         }
                     ),
                 )
-
-            terminal_text = output.getvalue()
-            self.assertEqual(
-                terminal_text,
-                (
-                    "> Lufthansa Alpha one\n"
-                    f"{TERMINAL_GREEN}Lufthansa Alpha 1{TERMINAL_RESET}\n"
+            transcriber._on_message(
+                None,
+                json.dumps(
+                    {
+                        "type": (
+                            "conversation.item."
+                            "input_audio_transcription.completed"
+                        ),
+                        "item_id": "radio-turn",
+                        "transcript": "Lufthansa Alpha one",
+                    }
                 ),
+            )
+
+            self.assertEqual(
+                sink.deltas,
+                [
+                    ("radio-turn", "Lufthansa "),
+                    ("radio-turn", "Lufthansa Alpha one"),
+                ],
+            )
+            self.assertEqual(
+                sink.completions,
+                [
+                    (
+                        "radio-turn",
+                        "Lufthansa Alpha one",
+                        "Lufthansa Alpha 1",
+                    )
+                ],
             )
 
 

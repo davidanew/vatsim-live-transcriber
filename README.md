@@ -1,8 +1,7 @@
 # VATSIM Live Transcriber
 
-A native Windows terminal program that captures an output device through WASAPI
-loopback and streams one selected stereo channel to OpenAI
-`gpt-live-transcribe`.
+A native Windows GUI that captures an output device through WASAPI loopback and
+streams one selected stereo channel to OpenAI `gpt-live-transcribe`.
 
 ## Start
 
@@ -19,14 +18,17 @@ Run:
 ```
 
 The first run offers to install the `uv` Python manager and creates a private
-Python environment inside this folder. It then lists Windows output devices and
-asks which device and channel to use.
+Python environment inside this folder. The app then opens a setup window for
+any device, channel, accuracy, or API-key setting not supplied on the command
+line.
 
 Choose **Left** or **Right** when the source contains two independent radio
 channels. **Mix** combines them and can reduce recognition accuracy when both
 channels contain speech.
 
-Press `Ctrl+C` to stop. Finalized turns are written to the `transcripts` folder.
+Use **Start** to connect and begin listening, and **Stop** to disconnect. You can
+start a fresh session again without reopening the app. Finalized turns are
+written to the `transcripts` folder.
 
 ## Useful options
 
@@ -51,9 +53,10 @@ Example for vPilot routed through VB-Audio Virtual Cable:
 Accuracy choices are `minimal`, `low`, `medium`, `high`, and `xhigh`.
 For difficult radio audio, start with `medium` or `high`.
 
-As live transcript deltas arrive, the original wording is appended to one white
-line prefixed with `> `. When that transmission finishes, a digit-normalized
-version is printed once in green underneath. For example,
+As live transcript deltas arrive, the GUI progressively updates the original
+white line prefixed with `> ` and its digit-normalized green line underneath.
+When that transmission finishes, both are replaced with the authoritative final
+versions. For example,
 `one one eight decimal five zero five` becomes `118.505`, and
 `Speedbird one two three` becomes `Speedbird 123`. Both finalized versions are
 saved as plain text in the transcript log. Number conversion also applies to
