@@ -287,8 +287,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--silence-ms",
         type=int,
-        default=650,
-        help="Silence that ends a radio turn (default: 650 ms).",
+        default=500,
+        help="Silence that ends a radio turn (default: 500 ms).",
     )
     return parser.parse_args()
 
