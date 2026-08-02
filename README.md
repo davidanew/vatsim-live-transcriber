@@ -42,6 +42,12 @@ Start without interactive device/channel questions:
 .\run.cmd --device 1 --channel left --delay medium
 ```
 
+Example for vPilot routed through VB-Audio Virtual Cable:
+
+```powershell
+.\run.cmd --device "CABLE In 16ch" --channel left --delay medium
+```
+
 Latency/accuracy choices are `minimal`, `low`, `medium`, `high`, and `xhigh`.
 For difficult radio audio, start with `medium` or `high`.
 
