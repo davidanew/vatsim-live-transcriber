@@ -39,16 +39,16 @@ List capture devices:
 Start without interactive device/channel questions:
 
 ```powershell
-.\run.cmd --device 1 --channel left --delay medium
+.\run.cmd --device 1 --channel left --accuracy medium
 ```
 
 Example for vPilot routed through VB-Audio Virtual Cable:
 
 ```powershell
-.\run.cmd --device "CABLE In 16ch" --channel left --delay medium
+.\run.cmd --device "CABLE In 16ch" --channel left --accuracy medium
 ```
 
-Latency/accuracy choices are `minimal`, `low`, `medium`, `high`, and `xhigh`.
+Accuracy choices are `minimal`, `low`, `medium`, `high`, and `xhigh`.
 For difficult radio audio, start with `medium` or `high`.
 
 Edit `keywords.txt` before starting to add current callsigns, airports,

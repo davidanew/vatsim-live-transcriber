@@ -43,10 +43,10 @@ def parse_args() -> argparse.Namespace:
         help="Stereo channel to send. Prompts when omitted.",
     )
     parser.add_argument(
-        "--delay",
+        "--accuracy",
         choices=("minimal", "low", "medium", "high", "xhigh"),
         default="medium",
-        help="Latency/accuracy tradeoff (default: medium).",
+        help="Transcription accuracy setting (default: medium).",
     )
     parser.add_argument(
         "--keywords",
@@ -252,7 +252,7 @@ class LiveTranscriber:
         api_key: str,
         device: Any,
         channel: str,
-        delay: str,
+        accuracy: str,
         prompt: str,
         keywords: list[str],
         output_path: Path,
@@ -266,7 +266,7 @@ class LiveTranscriber:
         self.websocket_module = websocket
         self.device = device
         self.channel = channel
-        self.delay = delay
+        self.accuracy = accuracy
         self.prompt = prompt
         self.keywords = keywords
         self.output_path = output_path
@@ -304,7 +304,8 @@ class LiveTranscriber:
                             "prompt": self.prompt,
                             "keywords": self.keywords,
                             "languages": ["en"],
-                            "delay": self.delay,
+                            # The API names this accuracy setting "delay".
+                            "delay": self.accuracy,
                         },
                         # Turn boundaries are supplied by LocalVad so short radio
                         # pauses can be tuned independently of server-side VAD.
@@ -487,7 +488,7 @@ def main() -> int:
     print("\nVATSIM Live Transcriber")
     print(f"  Device : {device.name}")
     print(f"  Channel: {channel}")
-    print(f"  Delay  : {args.delay}")
+    print(f"  Accuracy: {args.accuracy}")
     print("  Session type       : transcription")
     print(f"  Transcription model: {TRANSCRIPTION_MODEL}")
     print(f"  Log    : {output_path}")
@@ -497,7 +498,7 @@ def main() -> int:
         api_key=api_key,
         device=device,
         channel=channel,
-        delay=args.delay,
+        accuracy=args.accuracy,
         prompt=prompt,
         keywords=keywords,
         output_path=output_path,
