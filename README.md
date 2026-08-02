@@ -51,6 +51,14 @@ Example for vPilot routed through VB-Audio Virtual Cable:
 Accuracy choices are `minimal`, `low`, `medium`, `high`, and `xhigh`.
 For difficult radio audio, start with `medium` or `high`.
 
+As live transcript deltas arrive, the original wording is appended to one white
+line prefixed with `> `. When that transmission finishes, a digit-normalized
+version is printed once in green underneath. For example,
+`one one eight decimal five zero five` becomes `118.505`, and
+`Speedbird one two three` becomes `Speedbird 123`. Both finalized versions are
+saved as plain text in the transcript log. Number conversion also applies to
+headings, flight levels, runway numbers, squawks, QNH values, and altitudes.
+
 Edit `keywords.txt` before starting to add current callsigns, airports,
 frequencies, waypoints, SIDs and STARs. The API key is read from the
 `OPENAI_API_KEY` environment variable or requested without being saved.

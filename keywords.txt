@@ -1,4 +1,3 @@
-# ICAO phonetic alphabet
 Alpha
 Bravo
 Charlie
@@ -30,8 +29,17 @@ QNH
 RNAV
 Runway
 Speedbird
-Squawk
 Localiser
 Glidepath
 Flight level
 Shuttle
+Taxi
+Heathrow
+Ground
+Push And Start
+Approved
+Cleared for
+Departure
+Stand
+Airbus
+Virgin

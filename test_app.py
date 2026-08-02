@@ -1,13 +1,26 @@
+from contextlib import redirect_stdout
+from io import StringIO
+import json
+from pathlib import Path
+import tempfile
+import threading
 import unittest
 
 import numpy as np
 
 from app import (
+    LiveTranscriber,
     LocalVad,
     REALTIME_URL,
+    TERMINAL_GREEN,
+    TERMINAL_RESET,
     TRANSCRIPTION_MODEL,
+    detection_terminal_line,
     float_to_pcm16,
+    green_terminal_line,
+    normalize_spoken_numbers,
     select_channel,
+    transcript_variants,
 )
 
 
@@ -49,6 +62,118 @@ class AudioConversionTests(unittest.TestCase):
         )
         self.assertEqual(vad.process(b"tail-1", 0.0), ([b"tail-1"], False))
         self.assertEqual(vad.process(b"tail-2", 0.0), ([b"tail-2"], True))
+
+    def test_normalizes_frequency(self):
+        self.assertEqual(
+            normalize_spoken_numbers(
+                "contact tower one one eight decimal five zero five, bye"
+            ),
+            "contact tower 118.505, bye",
+        )
+
+    def test_normalizes_common_atc_numbers(self):
+        self.assertEqual(
+            normalize_spoken_numbers(
+                "Speedbird one two three, runway two seven left, "
+                "heading two seven zero, squawk seven zero zero zero"
+            ),
+            "Speedbird 123, runway 27 left, heading 270, squawk 7000",
+        )
+
+    def test_normalizes_cardinal_and_icao_number_words(self):
+        self.assertEqual(
+            normalize_spoken_numbers(
+                "climb six thousand feet, QNH one zero one three, "
+                "frequency one two tree decimal fife niner zero"
+            ),
+            "climb 6000 feet, QNH 1013, frequency 123.590",
+        )
+
+    def test_normalizes_double_and_triple_digits(self):
+        self.assertEqual(
+            normalize_spoken_numbers("squawk seven double zero, triple two"),
+            "squawk 700, 222",
+        )
+
+    def test_normalizes_nineer_spelling_variant(self):
+        self.assertEqual(
+            normalize_spoken_numbers(
+                "AC nineer nineer taxi left Echo hold Echo one."
+            ),
+            "AC 99 taxi left Echo hold Echo 1.",
+        )
+
+    def test_transcript_variants_keep_original_above_converted_text(self):
+        self.assertEqual(
+            transcript_variants("Speedbird one two three"),
+            ["Speedbird one two three", "Speedbird 123"],
+        )
+        self.assertEqual(
+            transcript_variants("No spoken numbers"),
+            ["No spoken numbers", "No spoken numbers"],
+        )
+
+    def test_converted_terminal_line_is_green(self):
+        self.assertEqual(
+            green_terminal_line("Speedbird 123"),
+            f"{TERMINAL_GREEN}Speedbird 123{TERMINAL_RESET}",
+        )
+
+    def test_detection_line_replaces_leading_space_with_marker(self):
+        self.assertEqual(
+            detection_terminal_line(" Hold short Kilo one."),
+            "> Hold short Kilo one.",
+        )
+        self.assertEqual(
+            detection_terminal_line("Bravo Kilo Hotel"),
+            "> Bravo Kilo Hotel",
+        )
+
+    def test_deltas_form_one_white_line_then_one_green_line(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            transcriber = LiveTranscriber.__new__(LiveTranscriber)
+            transcriber.streamed_text_for = {}
+            transcriber.log_lock = threading.Lock()
+            transcriber.output_path = Path(temp_dir) / "transcript.txt"
+
+            output = StringIO()
+            with redirect_stdout(output):
+                for delta in ("Lufthansa ", "Alpha one"):
+                    transcriber._on_message(
+                        None,
+                        json.dumps(
+                            {
+                                "type": (
+                                    "conversation.item."
+                                    "input_audio_transcription.delta"
+                                ),
+                                "item_id": "radio-turn",
+                                "delta": delta,
+                            }
+                        ),
+                    )
+                transcriber._on_message(
+                    None,
+                    json.dumps(
+                        {
+                            "type": (
+                                "conversation.item."
+                                "input_audio_transcription.completed"
+                            ),
+                            "item_id": "radio-turn",
+                            "transcript": "Lufthansa Alpha one",
+                        }
+                    ),
+                )
+
+            terminal_text = output.getvalue()
+            self.assertEqual(
+                terminal_text,
+                (
+                    "> Lufthansa Alpha one\n"
+                    f"{TERMINAL_GREEN}Lufthansa Alpha 1{TERMINAL_RESET}\n"
+                ),
+            )
 
 
 if __name__ == "__main__":

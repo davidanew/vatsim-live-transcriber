@@ -7,6 +7,7 @@ import getpass
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import threading
 from datetime import datetime
@@ -21,12 +22,217 @@ REALTIME_URL = "wss://api.openai.com/v1/realtime?intent=transcription"
 TRANSCRIPTION_MODEL = "gpt-live-transcribe"
 SAMPLE_RATE = 24_000
 FRAMES_PER_CHUNK = 2_400  # 100 ms
+TERMINAL_GREEN = "\033[32m"
+TERMINAL_RESET = "\033[0m"
 DEFAULT_PROMPT = (
     "English VATSIM air traffic control radio communications. Transcribe aviation "
     "phraseology exactly. Preserve callsigns, runway identifiers, headings, altitudes, "
     "flight levels, frequencies, squawk codes, waypoint names, registrations, and "
     "clearances. Do not invent missing speech."
 )
+
+# Spoken-number aliases include common ICAO pronunciations. The API often
+# returns these as words, so finalized transcripts are normalized locally.
+SPOKEN_DIGITS = {
+    "zero": "0",
+    "oh": "0",
+    "nought": "0",
+    "nil": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "tree": "3",
+    "four": "4",
+    "fower": "4",
+    "five": "5",
+    "fife": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "niner": "9",
+    "nineer": "9",
+}
+CARDINAL_VALUES = {
+    **{word: int(digit) for word, digit in SPOKEN_DIGITS.items()},
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+    "fifteen": 15,
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19,
+    "twenty": 20,
+    "thirty": 30,
+    "forty": 40,
+    "fifty": 50,
+    "sixty": 60,
+    "seventy": 70,
+    "eighty": 80,
+    "ninety": 90,
+}
+NUMBER_SCALES = {"hundred", "thousand", "million"}
+NUMBER_CONNECTORS = {"and", "decimal", "point"}
+NUMBER_REPEATS = {"double", "triple"}
+_NUMBER_START_WORDS = set(CARDINAL_VALUES) | NUMBER_REPEATS
+_NUMBER_WORDS = (
+    _NUMBER_START_WORDS | NUMBER_SCALES | NUMBER_CONNECTORS
+)
+_NUMBER_START_PATTERN = "|".join(
+    re.escape(word) for word in sorted(_NUMBER_START_WORDS, key=len, reverse=True)
+)
+_NUMBER_WORD_PATTERN = "|".join(
+    re.escape(word) for word in sorted(_NUMBER_WORDS, key=len, reverse=True)
+)
+_SPOKEN_NUMBER_PATTERN = re.compile(
+    rf"\b(?:{_NUMBER_START_PATTERN})"
+    rf"(?:(?:[\s-]+)(?:{_NUMBER_WORD_PATTERN}))*\b",
+    re.IGNORECASE,
+)
+_NUMBER_TOKEN_PATTERN = re.compile(
+    rf"\b(?:{_NUMBER_WORD_PATTERN})\b",
+    re.IGNORECASE,
+)
+
+
+def _expand_repeated_digits(tokens: list[str]) -> list[str] | None:
+    """Expand phrases such as 'double seven' before number parsing."""
+    expanded: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token not in NUMBER_REPEATS:
+            expanded.append(token)
+            index += 1
+            continue
+
+        if index + 1 >= len(tokens) or tokens[index + 1] not in SPOKEN_DIGITS:
+            return None
+        repetitions = 2 if token == "double" else 3
+        expanded.extend([tokens[index + 1]] * repetitions)
+        index += 2
+    return expanded
+
+
+def _parse_integer_words(tokens: list[str]) -> str | None:
+    """Convert digit-by-digit or cardinal number tokens to an integer string."""
+    tokens = [token for token in tokens if token != "and"]
+    if not tokens:
+        return None
+
+    if all(token in SPOKEN_DIGITS for token in tokens):
+        return "".join(SPOKEN_DIGITS[token] for token in tokens)
+
+    total = 0
+    current = 0
+    for token in tokens:
+        if token in CARDINAL_VALUES:
+            current += CARDINAL_VALUES[token]
+        elif token == "hundred":
+            current = max(1, current) * 100
+        elif token == "thousand":
+            total += max(1, current) * 1_000
+            current = 0
+        elif token == "million":
+            total = (total + max(1, current)) * 1_000_000
+            current = 0
+        else:
+            return None
+    return str(total + current)
+
+
+def _convert_number_tokens(tokens: list[str]) -> str | None:
+    """Convert one matched sequence of spoken-number tokens."""
+    expanded = _expand_repeated_digits(tokens)
+    if expanded is None:
+        return None
+    tokens = expanded
+
+    decimal_positions = [
+        index for index, token in enumerate(tokens) if token in {"decimal", "point"}
+    ]
+    if decimal_positions:
+        if len(decimal_positions) != 1:
+            return None
+        decimal_index = decimal_positions[0]
+        whole = _parse_integer_words(tokens[:decimal_index])
+        fraction_tokens = [
+            token for token in tokens[decimal_index + 1 :] if token != "and"
+        ]
+        if whole is None or not fraction_tokens:
+            return None
+        if not all(token in SPOKEN_DIGITS for token in fraction_tokens):
+            return None
+        fraction = "".join(SPOKEN_DIGITS[token] for token in fraction_tokens)
+        return f"{whole}.{fraction}"
+
+    # Without a scale word, "and" separates independent numbers rather than
+    # joining them into one digit sequence: "one and two" becomes "1 and 2".
+    if "and" in tokens and not any(token in NUMBER_SCALES for token in tokens):
+        groups: list[list[str]] = [[]]
+        for token in tokens:
+            if token == "and":
+                groups.append([])
+            else:
+                groups[-1].append(token)
+        converted = [_parse_integer_words(group) for group in groups]
+        if any(value is None for value in converted):
+            return None
+        return " and ".join(value for value in converted if value is not None)
+
+    return _parse_integer_words(tokens)
+
+
+def normalize_spoken_numbers(text: str) -> str:
+    """Render spoken number phrases as digits in a finalized transcript."""
+
+    def replace(match: re.Match[str]) -> str:
+        phrase = match.group(0)
+        trailing = ""
+
+        # Preserve a dangling connector captured before ordinary prose, as in
+        # "one and only", instead of accidentally deleting the word "and".
+        trailing_match = re.search(
+            r"(?P<separator>[\s-]+)(?P<word>and|decimal|point)$",
+            phrase,
+            re.IGNORECASE,
+        )
+        if trailing_match:
+            trailing = phrase[trailing_match.start() :]
+            phrase = phrase[: trailing_match.start()]
+
+        tokens = [
+            token.group(0).casefold()
+            for token in _NUMBER_TOKEN_PATTERN.finditer(phrase)
+        ]
+        converted = _convert_number_tokens(tokens)
+        if converted is None:
+            return match.group(0)
+        return converted + trailing
+
+    return _SPOKEN_NUMBER_PATTERN.sub(replace, text)
+
+
+def transcript_variants(raw_transcript: str) -> list[str]:
+    """Return the original transcript followed by its normalized copy."""
+    original = raw_transcript.strip()
+    if not original:
+        return []
+    normalized = normalize_spoken_numbers(original)
+    return [original, normalized]
+
+
+def green_terminal_line(text: str) -> str:
+    """Wrap one terminal line in ANSI green without affecting transcript logs."""
+    return f"{TERMINAL_GREEN}{text}{TERMINAL_RESET}"
+
+
+def detection_terminal_line(text: str) -> str:
+    """Prefix the original text for a newly detected radio transmission."""
+    return f"> {text.lstrip()}"
 
 
 def parse_args() -> argparse.Namespace:
@@ -276,7 +482,7 @@ class LiveTranscriber:
         self.connected = threading.Event()
         self.stop_requested = threading.Event()
         self.audio_thread: threading.Thread | None = None
-        self.printed_delta_for: set[str] = set()
+        self.streamed_text_for: dict[str, str] = {}
         self.log_lock = threading.Lock()
 
         # The intent query selects a dedicated transcription session. Passing a
@@ -372,26 +578,44 @@ class LiveTranscriber:
             item_id = str(event.get("item_id", ""))
             delta = str(event.get("delta", ""))
             if delta:
-                self.printed_delta_for.add(item_id)
-                sys.stdout.write(delta)
+                previous_text = self.streamed_text_for.get(item_id, "")
+                streamed_text = previous_text + delta
+                self.streamed_text_for[item_id] = streamed_text
+                # Each event contains only the new text. Appending that delta
+                # directly keeps one live white line without cursor redrawing.
+                displayed_delta = delta.lstrip() if not previous_text else delta
+                sys.stdout.write(
+                    f"> {displayed_delta}" if not previous_text else displayed_delta
+                )
                 sys.stdout.flush()
             return
 
         if event_type == "conversation.item.input_audio_transcription.completed":
             # Completed events contain the authoritative text written to disk.
             item_id = str(event.get("item_id", ""))
-            transcript = str(event.get("transcript", "")).strip()
-            if item_id in self.printed_delta_for:
+            raw_transcript = str(event.get("transcript", "")).strip()
+            variants = transcript_variants(raw_transcript)
+            streamed_text = self.streamed_text_for.pop(item_id, "")
+            if streamed_text:
+                # Finish the live white line, then show the authoritative
+                # number-normalized transcript once in green.
                 sys.stdout.write("\n")
+                if len(variants) > 1:
+                    print(green_terminal_line(variants[1]))
                 sys.stdout.flush()
-                self.printed_delta_for.discard(item_id)
-            elif transcript:
-                print(transcript)
-            if transcript:
+            else:
+                # A completed event can occasionally arrive without deltas.
+                if variants:
+                    print(detection_terminal_line(variants[0]))
+                if len(variants) > 1:
+                    print(green_terminal_line(variants[1]))
+            if variants:
                 timestamp = datetime.now().strftime("%H:%M:%S")
                 with self.log_lock:
                     with self.output_path.open("a", encoding="utf-8") as log:
-                        log.write(f"[{timestamp}] {transcript}\n")
+                        log.write(f"[{timestamp}] {variants[0]}\n")
+                        for variant in variants[1:]:
+                            log.write(f"           {variant}\n")
             return
 
         if event_type == "error":
