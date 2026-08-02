@@ -1,0 +1,30 @@
+# One literal hint per line. Add current callsigns, waypoints, airports,
+# frequencies, SIDs and STARs before starting a session.
+VATSIM
+Heathrow
+London Control
+Heathrow Director
+Heathrow Tower
+Speedbird
+Shuttle
+Finnair
+Virgin
+TAP
+QNH
+ILS
+localizer
+glidepath
+flight level
+squawk
+runway 27 left
+runway 27 right
+runway 27L
+runway 27R
+November Bravo
+Alpha
+Bravo
+Charlie
+Delta
+Echo
+Foxtrot
+Sierra

@@ -1,0 +1,477 @@
+from __future__ import annotations
+
+import argparse
+import base64
+from collections import deque
+import getpass
+import json
+import os
+from pathlib import Path
+import sys
+import threading
+from datetime import datetime
+from typing import Any
+
+import numpy as np
+
+
+REALTIME_URL = "wss://api.openai.com/v1/realtime?intent=transcription"
+TRANSCRIPTION_MODEL = "gpt-live-transcribe"
+SAMPLE_RATE = 24_000
+FRAMES_PER_CHUNK = 2_400  # 100 ms
+DEFAULT_PROMPT = (
+    "English VATSIM air traffic control radio communications. Transcribe aviation "
+    "phraseology exactly. Preserve callsigns, runway identifiers, headings, altitudes, "
+    "flight levels, frequencies, squawk codes, waypoint names, registrations, and "
+    "clearances. Do not invent missing speech."
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Live VATSIM/system-audio transcription with gpt-live-transcribe."
+    )
+    parser.add_argument(
+        "--device",
+        help="Loopback device number or part of its name. Prompts when omitted.",
+    )
+    parser.add_argument(
+        "--channel",
+        choices=("left", "right", "mix"),
+        help="Stereo channel to send. Prompts when omitted.",
+    )
+    parser.add_argument(
+        "--delay",
+        choices=("minimal", "low", "medium", "high", "xhigh"),
+        default="medium",
+        help="Latency/accuracy tradeoff (default: medium).",
+    )
+    parser.add_argument(
+        "--keywords",
+        type=Path,
+        default=Path(__file__).with_name("keywords.txt"),
+        help="Text file containing one keyword per line.",
+    )
+    parser.add_argument(
+        "--prompt-file",
+        type=Path,
+        help="Optional UTF-8 text file replacing the default ATC prompt.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Transcript log path (default: transcripts/<timestamp>.txt).",
+    )
+    parser.add_argument(
+        "--list-devices",
+        action="store_true",
+        help="List Windows loopback devices and exit.",
+    )
+    parser.add_argument(
+        "--vad-rms",
+        "--vad-threshold",
+        dest="vad_rms",
+        type=float,
+        default=0.008,
+        help="Local RMS level that starts/continues a transmission (default: 0.008).",
+    )
+    parser.add_argument(
+        "--silence-ms",
+        type=int,
+        default=650,
+        help="Silence that ends a radio turn (default: 650 ms).",
+    )
+    return parser.parse_args()
+
+
+def load_keywords(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+
+    keywords: list[str] = []
+    seen: set[str] = set()
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        keyword = raw_line.strip()
+        if not keyword or keyword.startswith("#"):
+            continue
+        if any(character in keyword for character in ("<", ">", "\r", "\n")):
+            raise ValueError(f"Invalid keyword: {keyword!r}")
+        key = keyword.casefold()
+        if key not in seen:
+            seen.add(key)
+            keywords.append(keyword)
+    return keywords
+
+
+def load_prompt(path: Path | None) -> str:
+    if path is None:
+        return DEFAULT_PROMPT
+    prompt = path.read_text(encoding="utf-8").strip()
+    if not prompt:
+        raise ValueError("The prompt file is empty.")
+    return " ".join(prompt.splitlines())
+
+
+def select_channel(samples: np.ndarray, channel: str) -> np.ndarray:
+    audio = np.asarray(samples)
+    if audio.ndim == 1:
+        return audio.astype(np.float32, copy=False)
+    if audio.ndim != 2 or audio.shape[1] < 1:
+        raise ValueError(f"Unexpected audio shape: {audio.shape}")
+
+    if channel == "left":
+        selected = audio[:, 0]
+    elif channel == "right":
+        if audio.shape[1] < 2:
+            raise ValueError("The selected device is mono; it has no right channel.")
+        selected = audio[:, 1]
+    elif channel == "mix":
+        selected = audio.mean(axis=1)
+    else:
+        raise ValueError(f"Unknown channel: {channel}")
+    return selected.astype(np.float32, copy=False)
+
+
+def float_to_pcm16(samples: np.ndarray) -> bytes:
+    clipped = np.clip(np.asarray(samples, dtype=np.float32), -1.0, 1.0)
+    return (clipped * 32767.0).astype("<i2").tobytes()
+
+
+class LocalVad:
+    def __init__(
+        self,
+        *,
+        threshold: float,
+        silence_ms: int,
+        chunk_ms: int = 100,
+        prefix_ms: int = 300,
+    ) -> None:
+        self.threshold = threshold
+        self.required_silent_chunks = max(1, round(silence_ms / chunk_ms))
+        self.prefix: deque[bytes] = deque(maxlen=max(1, round(prefix_ms / chunk_ms)))
+        self.active = False
+        self.silent_chunks = 0
+
+    def process(self, pcm: bytes, rms: float) -> tuple[list[bytes], bool]:
+        if not self.active:
+            self.prefix.append(pcm)
+            if rms < self.threshold:
+                return [], False
+
+            self.active = True
+            self.silent_chunks = 0
+            chunks = list(self.prefix)
+            self.prefix.clear()
+            return chunks, False
+
+        chunks = [pcm]
+        if rms >= self.threshold:
+            self.silent_chunks = 0
+            return chunks, False
+
+        self.silent_chunks += 1
+        if self.silent_chunks < self.required_silent_chunks:
+            return chunks, False
+
+        self.active = False
+        self.silent_chunks = 0
+        self.prefix.clear()
+        return chunks, True
+
+
+def choose_device(devices: list[Any], requested: str | None) -> Any:
+    if not devices:
+        raise RuntimeError(
+            "No WASAPI loopback devices were found. Check that Windows has an enabled "
+            "audio output device."
+        )
+
+    if requested:
+        if requested.isdigit():
+            index = int(requested)
+            if 1 <= index <= len(devices):
+                return devices[index - 1]
+            raise ValueError(f"Device number must be between 1 and {len(devices)}.")
+
+        matches = [
+            device for device in devices if requested.casefold() in device.name.casefold()
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if not matches:
+            raise ValueError(f"No loopback device contains {requested!r}.")
+        raise ValueError(f"More than one loopback device contains {requested!r}.")
+
+    print("\nWindows output devices:")
+    for index, device in enumerate(devices, start=1):
+        print(f"  {index}. {device.name}")
+
+    while True:
+        value = input(f"Choose device [1-{len(devices)}]: ").strip()
+        if value.isdigit() and 1 <= int(value) <= len(devices):
+            return devices[int(value) - 1]
+        print("Enter one of the displayed numbers.")
+
+
+def choose_channel(requested: str | None) -> str:
+    if requested:
+        return requested
+    print("\nAudio channel:")
+    print("  1. Left")
+    print("  2. Right")
+    print("  3. Mix both channels")
+    mapping = {"1": "left", "2": "right", "3": "mix"}
+    while True:
+        value = input("Choose channel [1-3]: ").strip()
+        if value in mapping:
+            return mapping[value]
+        print("Enter 1, 2, or 3.")
+
+
+class LiveTranscriber:
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        device: Any,
+        channel: str,
+        delay: str,
+        prompt: str,
+        keywords: list[str],
+        output_path: Path,
+        vad_rms: float,
+        silence_ms: int,
+    ) -> None:
+        import websocket
+
+        self.websocket_module = websocket
+        self.device = device
+        self.channel = channel
+        self.delay = delay
+        self.prompt = prompt
+        self.keywords = keywords
+        self.output_path = output_path
+        self.vad_rms = vad_rms
+        self.silence_ms = silence_ms
+        self.connected = threading.Event()
+        self.stop_requested = threading.Event()
+        self.audio_thread: threading.Thread | None = None
+        self.printed_delta_for: set[str] = set()
+        self.log_lock = threading.Lock()
+
+        # The intent query selects a dedicated transcription session. Passing a
+        # Realtime conversation model here creates an incompatible session type.
+        self.ws = websocket.WebSocketApp(
+            REALTIME_URL,
+            header={"Authorization": f"Bearer {api_key}"},
+            on_open=self._on_open,
+            on_message=self._on_message,
+            on_error=self._on_error,
+            on_close=self._on_close,
+        )
+
+    def session_update(self) -> dict[str, Any]:
+        return {
+            "type": "session.update",
+            "session": {
+                "type": "transcription",
+                "audio": {
+                    "input": {
+                        "format": {"type": "audio/pcm", "rate": SAMPLE_RATE},
+                        "transcription": {
+                            "model": TRANSCRIPTION_MODEL,
+                            "prompt": self.prompt,
+                            "keywords": self.keywords,
+                            "languages": ["en"],
+                            "delay": self.delay,
+                        },
+                        "turn_detection": None,
+                    }
+                },
+            },
+        }
+
+    def _on_open(self, ws: Any) -> None:
+        ws.send(json.dumps(self.session_update()))
+        self.connected.set()
+        print("Connected. Waiting for radio audio; press Ctrl+C to stop.\n")
+        self.audio_thread = threading.Thread(
+            target=self._capture_audio,
+            name="wasapi-capture",
+            daemon=True,
+        )
+        self.audio_thread.start()
+
+    def _capture_audio(self) -> None:
+        vad = LocalVad(
+            threshold=self.vad_rms,
+            silence_ms=self.silence_ms,
+            chunk_ms=round(FRAMES_PER_CHUNK * 1000 / SAMPLE_RATE),
+        )
+        try:
+            with self.device.recorder(samplerate=SAMPLE_RATE) as recorder:
+                while not self.stop_requested.is_set():
+                    frames = recorder.record(numframes=FRAMES_PER_CHUNK)
+                    mono = select_channel(frames, self.channel)
+                    pcm = float_to_pcm16(mono)
+                    rms = float(np.sqrt(np.mean(np.square(mono), dtype=np.float64)))
+                    chunks, commit = vad.process(pcm, rms)
+                    for chunk in chunks:
+                        event = {
+                            "type": "input_audio_buffer.append",
+                            "audio": base64.b64encode(chunk).decode("ascii"),
+                        }
+                        self.ws.send(json.dumps(event))
+                    if commit:
+                        self.ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+        except Exception as exc:
+            print(f"\nAudio capture failed: {exc}", file=sys.stderr)
+            self.stop_requested.set()
+            self.ws.close()
+
+    def _on_message(self, ws: Any, message: str) -> None:
+        try:
+            event = json.loads(message)
+        except json.JSONDecodeError:
+            print(f"\nUnexpected server message: {message}", file=sys.stderr)
+            return
+
+        event_type = event.get("type", "")
+        if event_type == "conversation.item.input_audio_transcription.delta":
+            item_id = str(event.get("item_id", ""))
+            delta = str(event.get("delta", ""))
+            if delta:
+                self.printed_delta_for.add(item_id)
+                sys.stdout.write(delta)
+                sys.stdout.flush()
+            return
+
+        if event_type == "conversation.item.input_audio_transcription.completed":
+            item_id = str(event.get("item_id", ""))
+            transcript = str(event.get("transcript", "")).strip()
+            if item_id in self.printed_delta_for:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                self.printed_delta_for.discard(item_id)
+            elif transcript:
+                print(transcript)
+            if transcript:
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                with self.log_lock:
+                    with self.output_path.open("a", encoding="utf-8") as log:
+                        log.write(f"[{timestamp}] {transcript}\n")
+            return
+
+        if event_type == "error":
+            error = event.get("error", {})
+            message_text = error.get("message", json.dumps(event))
+            print(f"\nOpenAI API error: {message_text}", file=sys.stderr)
+            self.stop_requested.set()
+            ws.close()
+
+    def _on_error(self, ws: Any, error: Any) -> None:
+        if not self.stop_requested.is_set():
+            print(f"\nWebSocket error: {error}", file=sys.stderr)
+
+    def _on_close(self, ws: Any, status_code: Any, message: Any) -> None:
+        self.stop_requested.set()
+        if status_code and status_code != 1000:
+            print(
+                f"\nConnection closed ({status_code}): {message or 'no reason supplied'}",
+                file=sys.stderr,
+            )
+
+    def run(self) -> None:
+        try:
+            self.ws.run_forever(ping_interval=20, ping_timeout=10)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.stop_requested.set()
+            self.ws.close()
+            if self.audio_thread and self.audio_thread.is_alive():
+                self.audio_thread.join(timeout=2)
+
+
+def main() -> int:
+    args = parse_args()
+    if not 0 < args.vad_rms <= 1:
+        print("--vad-rms must be greater than 0 and no greater than 1.", file=sys.stderr)
+        return 2
+    if args.silence_ms < 100:
+        print("--silence-ms must be at least 100.", file=sys.stderr)
+        return 2
+
+    try:
+        import soundcard as sc
+    except ImportError:
+        print("SoundCard is not installed. Run this program through run.ps1.", file=sys.stderr)
+        return 2
+
+    loopbacks = [
+        microphone
+        for microphone in sc.all_microphones(include_loopback=True)
+        if getattr(microphone, "isloopback", False)
+    ]
+
+    if args.list_devices:
+        if not loopbacks:
+            print("No WASAPI loopback devices were found.")
+            return 1
+        for index, device in enumerate(loopbacks, start=1):
+            print(f"{index}. {device.name}")
+        return 0
+
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        api_key = getpass.getpass("OpenAI API key (not saved): ").strip()
+    if not api_key:
+        print("An OpenAI API key is required.", file=sys.stderr)
+        return 2
+
+    try:
+        device = choose_device(loopbacks, args.device)
+        channel = choose_channel(args.channel)
+        keywords = load_keywords(args.keywords)
+        prompt = load_prompt(args.prompt_file)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return 2
+
+    if args.output:
+        output_path = args.output.expanduser().resolve()
+    else:
+        output_path = (
+            Path(__file__).parent
+            / "transcripts"
+            / f"vatsim-{datetime.now():%Y%m%d-%H%M%S}.txt"
+        )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    print("\nVATSIM Live Transcriber")
+    print(f"  Device : {device.name}")
+    print(f"  Channel: {channel}")
+    print(f"  Delay  : {args.delay}")
+    print("  Session type       : transcription")
+    print(f"  Transcription model: {TRANSCRIPTION_MODEL}")
+    print(f"  Log    : {output_path}")
+    print(f"  Keywords: {len(keywords)}")
+
+    transcriber = LiveTranscriber(
+        api_key=api_key,
+        device=device,
+        channel=channel,
+        delay=args.delay,
+        prompt=prompt,
+        keywords=keywords,
+        output_path=output_path,
+        vad_rms=args.vad_rms,
+        silence_ms=args.silence_ms,
+    )
+    transcriber.run()
+    print(f"\nStopped. Transcript saved to {output_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
