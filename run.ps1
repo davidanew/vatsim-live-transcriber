@@ -4,11 +4,14 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# Keep all generated Python files inside the project instead of modifying the
+# user's system Python installation.
 $appDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 $venvDirectory = Join-Path $appDirectory ".venv"
 $python = Join-Path $venvDirectory "Scripts\python.exe"
 
 function Find-Uv {
+    # Check PATH first, followed by the common per-user uv install locations.
     $command = Get-Command uv.exe -ErrorAction SilentlyContinue
     if ($command) {
         return $command.Source
@@ -42,6 +45,7 @@ if (-not $uv) {
 }
 
 if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
+    # Pin Python 3.11 because the audio dependencies are known to support it.
     Write-Host "Creating the private Python environment..."
     & $uv venv --python 3.11 $venvDirectory
     if ($LASTEXITCODE -ne 0) {
@@ -50,6 +54,7 @@ if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
 }
 
 Write-Host "Checking program dependencies..."
+# uv only installs missing or changed requirements, so subsequent starts are fast.
 & $uv pip install --quiet --python $python --requirements (Join-Path $appDirectory "requirements.txt")
 if ($LASTEXITCODE -ne 0) {
     throw "Could not install the program dependencies."

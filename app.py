@@ -15,6 +15,8 @@ from typing import Any
 import numpy as np
 
 
+# Realtime transcription accepts mono PCM16 audio at 24 kHz. Keeping capture
+# chunks at 100 ms provides frequent updates without excessive WebSocket traffic.
 REALTIME_URL = "wss://api.openai.com/v1/realtime?intent=transcription"
 TRANSCRIPTION_MODEL = "gpt-live-transcribe"
 SAMPLE_RATE = 24_000
@@ -85,6 +87,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_keywords(path: Path) -> list[str]:
+    """Load a case-insensitive, de-duplicated list of transcription hints."""
     if not path.exists():
         return []
 
@@ -104,6 +107,7 @@ def load_keywords(path: Path) -> list[str]:
 
 
 def load_prompt(path: Path | None) -> str:
+    """Return the built-in ATC prompt or a normalized user-supplied prompt."""
     if path is None:
         return DEFAULT_PROMPT
     prompt = path.read_text(encoding="utf-8").strip()
@@ -113,6 +117,7 @@ def load_prompt(path: Path | None) -> str:
 
 
 def select_channel(samples: np.ndarray, channel: str) -> np.ndarray:
+    """Select one radio channel or mix all channels down to mono."""
     audio = np.asarray(samples)
     if audio.ndim == 1:
         return audio.astype(np.float32, copy=False)
@@ -133,11 +138,19 @@ def select_channel(samples: np.ndarray, channel: str) -> np.ndarray:
 
 
 def float_to_pcm16(samples: np.ndarray) -> bytes:
+    """Convert SoundCard's normalized float samples to little-endian PCM16."""
+    # Clipping prevents values outside [-1, 1] from wrapping during conversion.
     clipped = np.clip(np.asarray(samples, dtype=np.float32), -1.0, 1.0)
     return (clipped * 32767.0).astype("<i2").tobytes()
 
 
 class LocalVad:
+    """Simple energy-based voice activity detector for radio transmissions.
+
+    The detector holds a short rolling prefix so the beginning of a callsign is
+    retained when the signal first crosses the configured RMS threshold.
+    """
+
     def __init__(
         self,
         *,
@@ -148,11 +161,13 @@ class LocalVad:
     ) -> None:
         self.threshold = threshold
         self.required_silent_chunks = max(1, round(silence_ms / chunk_ms))
+        # The prefix buffer contains audio immediately before speech detection.
         self.prefix: deque[bytes] = deque(maxlen=max(1, round(prefix_ms / chunk_ms)))
         self.active = False
         self.silent_chunks = 0
 
     def process(self, pcm: bytes, rms: float) -> tuple[list[bytes], bool]:
+        """Return chunks to send and whether the current turn should be committed."""
         if not self.active:
             self.prefix.append(pcm)
             if rms < self.threshold:
@@ -229,6 +244,8 @@ def choose_channel(requested: str | None) -> str:
 
 
 class LiveTranscriber:
+    """Connect Windows loopback capture to an OpenAI transcription session."""
+
     def __init__(
         self,
         *,
@@ -242,6 +259,8 @@ class LiveTranscriber:
         vad_rms: float,
         silence_ms: int,
     ) -> None:
+        # Imported lazily so argument/help and unit-test code can load without
+        # creating a WebSocket dependency at module import time.
         import websocket
 
         self.websocket_module = websocket
@@ -253,6 +272,7 @@ class LiveTranscriber:
         self.output_path = output_path
         self.vad_rms = vad_rms
         self.silence_ms = silence_ms
+        # The WebSocket callbacks and audio capture run on separate threads.
         self.connected = threading.Event()
         self.stop_requested = threading.Event()
         self.audio_thread: threading.Thread | None = None
@@ -271,6 +291,7 @@ class LiveTranscriber:
         )
 
     def session_update(self) -> dict[str, Any]:
+        """Build the initial transcription-session configuration event."""
         return {
             "type": "session.update",
             "session": {
@@ -285,6 +306,8 @@ class LiveTranscriber:
                             "languages": ["en"],
                             "delay": self.delay,
                         },
+                        # Turn boundaries are supplied by LocalVad so short radio
+                        # pauses can be tuned independently of server-side VAD.
                         "turn_detection": None,
                     }
                 },
@@ -295,6 +318,8 @@ class LiveTranscriber:
         ws.send(json.dumps(self.session_update()))
         self.connected.set()
         print("Connected. Waiting for radio audio; press Ctrl+C to stop.\n")
+        # Audio capture would block the WebSocket callback loop, so it runs in a
+        # daemon thread and sends events through the shared WebSocket object.
         self.audio_thread = threading.Thread(
             target=self._capture_audio,
             name="wasapi-capture",
@@ -314,15 +339,19 @@ class LiveTranscriber:
                     frames = recorder.record(numframes=FRAMES_PER_CHUNK)
                     mono = select_channel(frames, self.channel)
                     pcm = float_to_pcm16(mono)
+                    # RMS is an inexpensive signal-energy measurement suitable
+                    # for detecting the start and end of push-to-talk audio.
                     rms = float(np.sqrt(np.mean(np.square(mono), dtype=np.float64)))
                     chunks, commit = vad.process(pcm, rms)
                     for chunk in chunks:
+                        # Realtime API audio events carry base64-encoded PCM bytes.
                         event = {
                             "type": "input_audio_buffer.append",
                             "audio": base64.b64encode(chunk).decode("ascii"),
                         }
                         self.ws.send(json.dumps(event))
                     if commit:
+                        # A commit asks the model to finalize this radio turn.
                         self.ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
         except Exception as exc:
             print(f"\nAudio capture failed: {exc}", file=sys.stderr)
@@ -338,6 +367,7 @@ class LiveTranscriber:
 
         event_type = event.get("type", "")
         if event_type == "conversation.item.input_audio_transcription.delta":
+            # Deltas provide immediate terminal feedback while speech is decoded.
             item_id = str(event.get("item_id", ""))
             delta = str(event.get("delta", ""))
             if delta:
@@ -347,6 +377,7 @@ class LiveTranscriber:
             return
 
         if event_type == "conversation.item.input_audio_transcription.completed":
+            # Completed events contain the authoritative text written to disk.
             item_id = str(event.get("item_id", ""))
             transcript = str(event.get("transcript", "")).strip()
             if item_id in self.printed_delta_for:
@@ -382,6 +413,7 @@ class LiveTranscriber:
             )
 
     def run(self) -> None:
+        """Run until Ctrl+C, an API error, or the WebSocket closes."""
         try:
             self.ws.run_forever(ping_interval=20, ping_timeout=10)
         except KeyboardInterrupt:
@@ -403,6 +435,8 @@ def main() -> int:
         return 2
 
     try:
+        # SoundCard exposes Windows playback endpoints as WASAPI loopback
+        # microphones, allowing the program to capture CABLE In from vPilot.
         import soundcard as sc
     except ImportError:
         print("SoundCard is not installed. Run this program through run.ps1.", file=sys.stderr)
@@ -424,6 +458,7 @@ def main() -> int:
 
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
+        # getpass keeps a manually entered key out of terminal history and logs.
         api_key = getpass.getpass("OpenAI API key (not saved): ").strip()
     if not api_key:
         print("An OpenAI API key is required.", file=sys.stderr)
@@ -441,6 +476,7 @@ def main() -> int:
     if args.output:
         output_path = args.output.expanduser().resolve()
     else:
+        # Use a new timestamped log for every run to preserve older transcripts.
         output_path = (
             Path(__file__).parent
             / "transcripts"
