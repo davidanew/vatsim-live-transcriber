@@ -573,9 +573,10 @@ def create_transcript_window(
             self.status.setStyleSheet("color: #9ca3af; font-weight: 600;")
             toolbar.addWidget(self.status)
             toolbar.addStretch()
-            clear_button = QPushButton("Clear")
-            clear_button.clicked.connect(self._clear)
-            toolbar.addWidget(clear_button)
+            self.clear_button = QPushButton("Clear")
+            self.clear_button.clicked.connect(self._clear)
+            self.clear_button.setEnabled(False)
+            toolbar.addWidget(self.clear_button)
             self.start_button = QPushButton("Start")
             self.start_button.clicked.connect(self._request_start)
             toolbar.addWidget(self.start_button)
@@ -611,6 +612,8 @@ def create_transcript_window(
                 "QPushButton { background: #1f2937; border: 1px solid #374151;"
                 "padding: 6px 14px; border-radius: 4px; }"
                 "QPushButton:hover { background: #374151; }"
+                "QPushButton:disabled { background: #111827; color: #4b5563;"
+                "border-color: #1f2937; }"
             )
 
             queued = Qt.ConnectionType.QueuedConnection
@@ -677,6 +680,7 @@ def create_transcript_window(
             cursor.setPosition(start)
             cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
             self.live_cursors[item_id] = cursor
+            self.clear_button.setEnabled(True)
             self.text.moveCursor(QTextCursor.MoveOperation.End)
             self.text.ensureCursorVisible()
 
@@ -691,6 +695,7 @@ def create_transcript_window(
                 cursor.removeSelectedText()
             cursor.insertText(f"> {original}\n", self.original_format)
             cursor.insertText(f"{converted}\n", self.converted_format)
+            self.clear_button.setEnabled(True)
             self.text.moveCursor(QTextCursor.MoveOperation.End)
             self.text.ensureCursorVisible()
 
@@ -698,6 +703,7 @@ def create_transcript_window(
         def _clear(self) -> None:
             self.text.clear()
             self.live_cursors.clear()
+            self.clear_button.setEnabled(False)
 
         @Slot()
         def _request_start(self) -> None:
