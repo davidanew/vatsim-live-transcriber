@@ -43,3 +43,4 @@ Departure
 Stand
 Airbus
 Virgin
+Cleared to land

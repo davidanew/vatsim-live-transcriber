@@ -28,7 +28,9 @@ channels contain speech.
 
 Use **Start** to connect and begin listening, and **Stop** to disconnect. You can
 start a fresh session again without reopening the app. Finalized turns are
-written to the `transcripts` folder.
+written to the `transcripts` folder. Each detected turn is also saved as a mono
+24 kHz WAV file in the session's `-audio` folder. Every completed transcript row
+has its own **Play** button for replaying that transmission.
 
 ## Useful options
 

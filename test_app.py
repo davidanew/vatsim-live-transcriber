@@ -1,8 +1,10 @@
+from collections import deque
 import json
 from pathlib import Path
 import tempfile
 import threading
 import unittest
+import wave
 
 import numpy as np
 
@@ -15,6 +17,7 @@ from app import (
     normalize_spoken_numbers,
     select_channel,
     transcript_variants,
+    write_pcm16_wav,
 )
 
 
@@ -37,6 +40,17 @@ class AudioConversionTests(unittest.TestCase):
             dtype="<i2",
         )
         self.assertEqual(pcm.tolist(), [-32767, 0, 32767])
+
+    def test_writes_mono_pcm16_recording(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "turn.wav"
+            pcm = b"\x00\x00\xff\x7f\x01\x80"
+            write_pcm16_wav(path, pcm)
+            with wave.open(str(path), "rb") as recording:
+                self.assertEqual(recording.getnchannels(), 1)
+                self.assertEqual(recording.getsampwidth(), 2)
+                self.assertEqual(recording.getframerate(), 24_000)
+                self.assertEqual(recording.readframes(3), pcm)
 
     def test_websocket_requests_a_transcription_session(self):
         self.assertEqual(
@@ -116,17 +130,32 @@ class AudioConversionTests(unittest.TestCase):
             def delta(self, item_id, text):
                 self.deltas.append((item_id, text))
 
-            def completed(self, item_id, original, converted):
-                self.completions.append((item_id, original, converted))
+            def completed(self, item_id, original, converted, audio_path):
+                self.completions.append(
+                    (item_id, original, converted, audio_path)
+                )
 
         with tempfile.TemporaryDirectory() as temp_dir:
             sink = RecordingSink()
             transcriber = LiveTranscriber.__new__(LiveTranscriber)
             transcriber.streamed_text_for = {}
             transcriber.log_lock = threading.Lock()
+            transcriber.recording_lock = threading.Lock()
+            recording_path = Path(temp_dir) / "turn-0001.wav"
+            transcriber.pending_recordings = deque([recording_path])
+            transcriber.recording_for_item = {}
             transcriber.output_path = Path(temp_dir) / "transcript.txt"
             transcriber.event_sink = sink
 
+            transcriber._on_message(
+                None,
+                json.dumps(
+                    {
+                        "type": "input_audio_buffer.committed",
+                        "item_id": "radio-turn",
+                    }
+                ),
+            )
             for delta in ("Lufthansa ", "Alpha one"):
                 transcriber._on_message(
                     None,
@@ -169,6 +198,7 @@ class AudioConversionTests(unittest.TestCase):
                         "radio-turn",
                         "Lufthansa Alpha one",
                         "Lufthansa Alpha 1",
+                        str(recording_path),
                     )
                 ],
             )

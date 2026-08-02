@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import sys
 import threading
+import wave
 from datetime import datetime
 from typing import Any, Protocol
 
@@ -36,7 +37,13 @@ class TranscriptEventSink(Protocol):
 
     def delta(self, item_id: str, text: str) -> None: ...
 
-    def completed(self, item_id: str, original: str, converted: str) -> None: ...
+    def completed(
+        self,
+        item_id: str,
+        original: str,
+        converted: str,
+        audio_path: str,
+    ) -> None: ...
 
     def error(self, message: str) -> None: ...
 
@@ -351,6 +358,16 @@ def float_to_pcm16(samples: np.ndarray) -> bytes:
     return (clipped * 32767.0).astype("<i2").tobytes()
 
 
+def write_pcm16_wav(path: Path, pcm: bytes) -> None:
+    """Write captured mono PCM16 audio as a standard WAV recording."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as recording:
+        recording.setnchannels(1)
+        recording.setsampwidth(2)
+        recording.setframerate(SAMPLE_RATE)
+        recording.writeframes(pcm)
+
+
 class LocalVad:
     """Simple energy-based voice activity detector for radio transmissions.
 
@@ -522,30 +539,94 @@ def create_transcript_window(
     channel: str,
     accuracy: str,
     output_path: Path,
+    recordings_dir: Path,
 ) -> Any:
     """Create the Qt transcript window and its thread-safe event signals."""
-    from PySide6.QtCore import Qt, Signal, Slot
-    from PySide6.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
+    from PySide6.QtCore import QTimer, Qt, Signal, Slot
     from PySide6.QtWidgets import (
+        QFrame,
         QHBoxLayout,
         QLabel,
         QMainWindow,
-        QPlainTextEdit,
         QPushButton,
+        QScrollArea,
         QVBoxLayout,
         QWidget,
     )
 
+    class TransmissionRow(QFrame):
+        """One progressively updated transcript with its own replay control."""
+
+        def __init__(self, play_callback: Any) -> None:
+            super().__init__()
+            self.audio_path: Path | None = None
+            self.play_callback = play_callback
+            self.setObjectName("transmissionRow")
+            layout = QHBoxLayout(self)
+            layout.setContentsMargins(14, 12, 12, 12)
+            layout.setSpacing(12)
+
+            text_layout = QVBoxLayout()
+            text_layout.setSpacing(5)
+            layout.addLayout(text_layout, 1)
+            self.original_label = QLabel()
+            self.original_label.setTextFormat(Qt.TextFormat.PlainText)
+            self.original_label.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            self.original_label.setWordWrap(True)
+            self.original_label.setStyleSheet(
+                "color: #f3f4f6; font-family: Consolas; font-size: 14px;"
+            )
+            text_layout.addWidget(self.original_label)
+            self.converted_label = QLabel()
+            self.converted_label.setTextFormat(Qt.TextFormat.PlainText)
+            self.converted_label.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            self.converted_label.setWordWrap(True)
+            self.converted_label.setStyleSheet(
+                "color: #22c55e; font-family: Consolas; font-size: 14px;"
+            )
+            text_layout.addWidget(self.converted_label)
+
+            self.play_button = QPushButton("Play")
+            self.play_button.setEnabled(False)
+            self.play_button.clicked.connect(self._play)
+            layout.addWidget(
+                self.play_button,
+                0,
+                Qt.AlignmentFlag.AlignTop,
+            )
+
+        def update_text(self, original: str, converted: str) -> None:
+            self.original_label.setText(f"> {original}")
+            self.converted_label.setText(converted)
+
+        def finalize(
+            self, original: str, converted: str, audio_path: str
+        ) -> None:
+            self.update_text(original, converted)
+            if audio_path:
+                self.audio_path = Path(audio_path)
+                self.play_button.setEnabled(True)
+
+        @Slot()
+        def _play(self) -> None:
+            if self.audio_path is not None:
+                self.play_callback(self.audio_path, self.play_button)
+
     class TranscriptWindow(QMainWindow):
         connected_signal = Signal()
         delta_signal = Signal(str, str)
-        completed_signal = Signal(str, str, str)
+        completed_signal = Signal(str, str, str, str)
         error_signal = Signal(str)
         stopped_signal = Signal(str)
 
         def __init__(self) -> None:
             super().__init__()
-            self.live_cursors: dict[str, QTextCursor] = {}
+            self.live_rows: dict[str, TransmissionRow] = {}
+            self.transmission_rows: list[TransmissionRow] = []
             self.start_callback: Any | None = None
             self.stop_callback: Any | None = None
             self.setWindowTitle("VATSIM Live Transcriber")
@@ -586,29 +667,34 @@ def create_transcript_window(
             toolbar.addWidget(self.stop_button)
             layout.addLayout(toolbar)
 
-            self.text = QPlainTextEdit()
-            self.text.setReadOnly(True)
-            self.text.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
-            self.text.setFont(QFont("Consolas", 13))
-            self.text.setStyleSheet(
-                "QPlainTextEdit {"
-                "background: #030712; color: #f3f4f6; border: 1px solid #1f2937;"
-                "padding: 12px; selection-background-color: #374151;"
-                "}"
+            self.scroll_area = QScrollArea()
+            self.scroll_area.setWidgetResizable(True)
+            self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+            self.scroll_area.setStyleSheet(
+                "QScrollArea { background: #030712;"
+                "border: 1px solid #1f2937; }"
             )
-            layout.addWidget(self.text, 1)
+            self.rows_container = QWidget()
+            self.rows_container.setObjectName("rowsContainer")
+            self.rows_layout = QVBoxLayout(self.rows_container)
+            self.rows_layout.setContentsMargins(10, 10, 10, 10)
+            self.rows_layout.setSpacing(8)
+            self.rows_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+            self.scroll_area.setWidget(self.rows_container)
+            layout.addWidget(self.scroll_area, 1)
 
-            path_label = QLabel(f"Transcript: {output_path}")
+            path_label = QLabel(
+                f"Transcript: {output_path}\nRecordings: {recordings_dir}"
+            )
             path_label.setStyleSheet("color: #6b7280;")
             layout.addWidget(path_label)
 
-            self.original_format = QTextCharFormat()
-            self.original_format.setForeground(QColor("#f3f4f6"))
-            self.converted_format = QTextCharFormat()
-            self.converted_format.setForeground(QColor("#22c55e"))
-
             self.setStyleSheet(
                 "QMainWindow, QWidget { background: #0b1220; color: #f9fafb; }"
+                "QLabel { background: transparent; }"
+                "QWidget#rowsContainer { background: #030712; }"
+                "QFrame#transmissionRow { background: #111827;"
+                "border: 1px solid #1f2937; border-radius: 5px; }"
                 "QPushButton { background: #1f2937; border: 1px solid #374151;"
                 "padding: 6px 14px; border-radius: 4px; }"
                 "QPushButton:hover { background: #374151; }"
@@ -638,9 +724,18 @@ def create_transcript_window(
             self.delta_signal.emit(item_id, text)
 
         def completed(
-            self, item_id: str, original: str, converted: str
+            self,
+            item_id: str,
+            original: str,
+            converted: str,
+            audio_path: str,
         ) -> None:
-            self.completed_signal.emit(item_id, original, converted)
+            self.completed_signal.emit(
+                item_id,
+                original,
+                converted,
+                audio_path,
+            )
 
         def error(self, message: str) -> None:
             self.error_signal.emit(message)
@@ -655,54 +750,62 @@ def create_transcript_window(
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(True)
 
-        def _new_live_cursor(self) -> QTextCursor:
-            cursor = self.text.textCursor()
-            cursor.movePosition(QTextCursor.MoveOperation.End)
-            if not self.text.document().isEmpty():
-                cursor.insertText("\n", self.original_format)
-            return cursor
+        def _new_transmission_row(self) -> TransmissionRow:
+            row = TransmissionRow(self._play_audio)
+            self.transmission_rows.append(row)
+            self.rows_layout.addWidget(row)
+            self.clear_button.setEnabled(True)
+            return row
+
+        def _scroll_to_bottom(self) -> None:
+            scroll_bar = self.scroll_area.verticalScrollBar()
+            scroll_bar.setValue(scroll_bar.maximum())
 
         @Slot(str, str)
         def _show_delta(self, item_id: str, text: str) -> None:
-            cursor = self.live_cursors.pop(item_id, None)
-            if cursor is None:
-                cursor = self._new_live_cursor()
-            else:
-                cursor.removeSelectedText()
-            start = cursor.position()
+            row = self.live_rows.get(item_id)
+            if row is None:
+                row = self._new_transmission_row()
+                self.live_rows[item_id] = row
             original = text.lstrip()
-            cursor.insertText(f"> {original}\n", self.original_format)
-            cursor.insertText(
-                normalize_spoken_numbers(original),
-                self.converted_format,
-            )
-            end = cursor.position()
-            cursor.setPosition(start)
-            cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
-            self.live_cursors[item_id] = cursor
-            self.clear_button.setEnabled(True)
-            self.text.moveCursor(QTextCursor.MoveOperation.End)
-            self.text.ensureCursorVisible()
+            row.update_text(original, normalize_spoken_numbers(original))
+            QTimer.singleShot(0, self._scroll_to_bottom)
 
-        @Slot(str, str, str)
+        @Slot(str, str, str, str)
         def _show_completed(
-            self, item_id: str, original: str, converted: str
+            self,
+            item_id: str,
+            original: str,
+            converted: str,
+            audio_path: str,
         ) -> None:
-            cursor = self.live_cursors.pop(item_id, None)
-            if cursor is None:
-                cursor = self._new_live_cursor()
-            else:
-                cursor.removeSelectedText()
-            cursor.insertText(f"> {original}\n", self.original_format)
-            cursor.insertText(f"{converted}\n", self.converted_format)
-            self.clear_button.setEnabled(True)
-            self.text.moveCursor(QTextCursor.MoveOperation.End)
-            self.text.ensureCursorVisible()
+            row = self.live_rows.pop(item_id, None)
+            if row is None:
+                row = self._new_transmission_row()
+            row.finalize(original, converted, audio_path)
+            QTimer.singleShot(0, self._scroll_to_bottom)
+
+        def _play_audio(self, audio_path: Path, button: QPushButton) -> None:
+            if not audio_path.exists():
+                button.setEnabled(False)
+                self._show_error("The recording could not be found.")
+                return
+            import winsound
+
+            winsound.PlaySound(
+                str(audio_path),
+                winsound.SND_FILENAME
+                | winsound.SND_ASYNC
+                | winsound.SND_NODEFAULT,
+            )
 
         @Slot()
         def _clear(self) -> None:
-            self.text.clear()
-            self.live_cursors.clear()
+            self.live_rows.clear()
+            for row in self.transmission_rows:
+                self.rows_layout.removeWidget(row)
+                row.deleteLater()
+            self.transmission_rows.clear()
             self.clear_button.setEnabled(False)
 
         @Slot()
@@ -757,6 +860,7 @@ class LiveTranscriber:
         prompt: str,
         keywords: list[str],
         output_path: Path,
+        recordings_dir: Path,
         vad_rms: float,
         silence_ms: int,
         event_sink: TranscriptEventSink,
@@ -772,6 +876,7 @@ class LiveTranscriber:
         self.prompt = prompt
         self.keywords = keywords
         self.output_path = output_path
+        self.recordings_dir = recordings_dir
         self.vad_rms = vad_rms
         self.silence_ms = silence_ms
         self.event_sink = event_sink
@@ -781,6 +886,11 @@ class LiveTranscriber:
         self.audio_thread: threading.Thread | None = None
         self.streamed_text_for: dict[str, str] = {}
         self.log_lock = threading.Lock()
+        self.recording_lock = threading.Lock()
+        self.pending_recordings: deque[Path] = deque()
+        self.recording_for_item: dict[str, Path] = {}
+        self.recording_number = 0
+        self.recording_session = datetime.now().strftime("%H%M%S-%f")
         self.error_reported = False
         self.stopped_reported = False
 
@@ -842,12 +952,46 @@ class LiveTranscriber:
             self.stopped_reported = True
             self.event_sink.stopped("Stopped - press Start to reconnect")
 
+    def _save_recording(self, pcm: bytes) -> Path | None:
+        """Persist one committed turn and queue it for its server item ID."""
+        if not pcm:
+            return None
+        with self.recording_lock:
+            self.recording_number += 1
+            path = self.recordings_dir / (
+                f"turn-{self.recording_session}-"
+                f"{self.recording_number:04d}.wav"
+            )
+        try:
+            write_pcm16_wav(path, pcm)
+        except OSError as exc:
+            self._report_error(f"Could not save recording: {exc}")
+            return None
+        with self.recording_lock:
+            self.pending_recordings.append(path)
+        return path
+
+    def _bind_recording(self, item_id: str) -> Path | None:
+        """Associate the next committed WAV with an OpenAI transcript item."""
+        if not item_id:
+            return None
+        with self.recording_lock:
+            existing = self.recording_for_item.get(item_id)
+            if existing is not None:
+                return existing
+            if not self.pending_recordings:
+                return None
+            path = self.pending_recordings.popleft()
+            self.recording_for_item[item_id] = path
+            return path
+
     def _capture_audio(self) -> None:
         vad = LocalVad(
             threshold=self.vad_rms,
             silence_ms=self.silence_ms,
             chunk_ms=round(FRAMES_PER_CHUNK * 1000 / SAMPLE_RATE),
         )
+        turn_audio = bytearray()
         try:
             with self.device.recorder(samplerate=SAMPLE_RATE) as recorder:
                 while not self.stop_requested.is_set():
@@ -859,6 +1003,7 @@ class LiveTranscriber:
                     rms = float(np.sqrt(np.mean(np.square(mono), dtype=np.float64)))
                     chunks, commit = vad.process(pcm, rms)
                     for chunk in chunks:
+                        turn_audio.extend(chunk)
                         # Realtime API audio events carry base64-encoded PCM bytes.
                         event = {
                             "type": "input_audio_buffer.append",
@@ -866,6 +1011,10 @@ class LiveTranscriber:
                         }
                         self.ws.send(json.dumps(event))
                     if commit:
+                        # Save exactly the same PCM audio that was sent for this
+                        # turn before asking the server to finalize it.
+                        self._save_recording(bytes(turn_audio))
+                        turn_audio.clear()
                         # A commit asks the model to finalize this radio turn.
                         self.ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
         except Exception as exc:
@@ -881,11 +1030,17 @@ class LiveTranscriber:
             return
 
         event_type = event.get("type", "")
+        if event_type == "input_audio_buffer.committed":
+            # The server assigns the committed audio turn its durable item ID.
+            self._bind_recording(str(event.get("item_id", "")))
+            return
+
         if event_type == "conversation.item.input_audio_transcription.delta":
             # The GUI replaces one live text range as each delta arrives.
             item_id = str(event.get("item_id", ""))
             delta = str(event.get("delta", ""))
             if delta:
+                self._bind_recording(item_id)
                 previous_text = self.streamed_text_for.get(item_id, "")
                 streamed_text = previous_text + delta
                 self.streamed_text_for[item_id] = streamed_text
@@ -898,8 +1053,16 @@ class LiveTranscriber:
             raw_transcript = str(event.get("transcript", "")).strip()
             variants = transcript_variants(raw_transcript)
             self.streamed_text_for.pop(item_id, "")
+            recording_path = self._bind_recording(item_id)
             if variants:
-                self.event_sink.completed(item_id, variants[0], variants[1])
+                self.event_sink.completed(
+                    item_id,
+                    variants[0],
+                    variants[1],
+                    str(recording_path) if recording_path is not None else "",
+                )
+            with self.recording_lock:
+                self.recording_for_item.pop(item_id, None)
             if variants:
                 timestamp = datetime.now().strftime("%H:%M:%S")
                 with self.log_lock:
@@ -907,6 +1070,8 @@ class LiveTranscriber:
                         log.write(f"[{timestamp}] {variants[0]}\n")
                         for variant in variants[1:]:
                             log.write(f"           {variant}\n")
+                        if recording_path is not None:
+                            log.write(f"           [audio] {recording_path}\n")
             return
 
         if event_type == "error":
@@ -1034,12 +1199,14 @@ def main() -> int:
             / f"vatsim-{datetime.now():%Y%m%d-%H%M%S}.txt"
         )
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    recordings_dir = output_path.parent / f"{output_path.stem}-audio"
 
     window = create_transcript_window(
         device_name=device.name,
         channel=channel,
         accuracy=accuracy,
         output_path=output_path,
+        recordings_dir=recordings_dir,
     )
     active_transcriber: LiveTranscriber | None = None
     active_worker: threading.Thread | None = None
@@ -1058,6 +1225,7 @@ def main() -> int:
             prompt=prompt,
             keywords=keywords,
             output_path=output_path,
+            recordings_dir=recordings_dir,
             vad_rms=args.vad_rms,
             silence_ms=args.silence_ms,
             event_sink=window,
