@@ -627,6 +627,7 @@ def create_transcript_window(
             super().__init__()
             self.live_rows: dict[str, TransmissionRow] = {}
             self.transmission_rows: list[TransmissionRow] = []
+            self.follow_live_text = True
             self.start_callback: Any | None = None
             self.stop_callback: Any | None = None
             self.setWindowTitle("VATSIM Live Transcriber")
@@ -682,6 +683,9 @@ def create_transcript_window(
             self.rows_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
             self.scroll_area.setWidget(self.rows_container)
             layout.addWidget(self.scroll_area, 1)
+            scroll_bar = self.scroll_area.verticalScrollBar()
+            scroll_bar.valueChanged.connect(self._scroll_position_changed)
+            scroll_bar.rangeChanged.connect(self._scroll_range_changed)
 
             path_label = QLabel(
                 f"Transcript: {output_path}\nRecordings: {recordings_dir}"
@@ -761,6 +765,18 @@ def create_transcript_window(
             scroll_bar = self.scroll_area.verticalScrollBar()
             scroll_bar.setValue(scroll_bar.maximum())
 
+        @Slot(int)
+        def _scroll_position_changed(self, value: int) -> None:
+            """Track whether the user has deliberately moved from the end."""
+            scroll_bar = self.scroll_area.verticalScrollBar()
+            self.follow_live_text = scroll_bar.maximum() - value <= 4
+
+        @Slot(int, int)
+        def _scroll_range_changed(self, _minimum: int, _maximum: int) -> None:
+            """Keep following when expanding transcript rows change the range."""
+            if self.follow_live_text:
+                self._scroll_to_bottom()
+
         @Slot(str, str)
         def _show_delta(self, item_id: str, text: str) -> None:
             row = self.live_rows.get(item_id)
@@ -769,7 +785,8 @@ def create_transcript_window(
                 self.live_rows[item_id] = row
             original = text.lstrip()
             row.update_text(original, normalize_spoken_numbers(original))
-            QTimer.singleShot(0, self._scroll_to_bottom)
+            if self.follow_live_text:
+                QTimer.singleShot(0, self._scroll_to_bottom)
 
         @Slot(str, str, str, str)
         def _show_completed(
@@ -783,7 +800,8 @@ def create_transcript_window(
             if row is None:
                 row = self._new_transmission_row()
             row.finalize(original, converted, audio_path)
-            QTimer.singleShot(0, self._scroll_to_bottom)
+            if self.follow_live_text:
+                QTimer.singleShot(0, self._scroll_to_bottom)
 
         def _play_audio(self, audio_path: Path, button: QPushButton) -> None:
             if not audio_path.exists():
