@@ -680,7 +680,9 @@ def create_transcript_window(
             self.rows_layout = QVBoxLayout(self.rows_container)
             self.rows_layout.setContentsMargins(10, 10, 10, 10)
             self.rows_layout.setSpacing(8)
-            self.rows_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+            # Keep the latest transmission at the bottom when the history is
+            # shorter than the available viewport, like a live message feed.
+            self.rows_layout.setAlignment(Qt.AlignmentFlag.AlignBottom)
             self.scroll_area.setWidget(self.rows_container)
             layout.addWidget(self.scroll_area, 1)
             scroll_bar = self.scroll_area.verticalScrollBar()
