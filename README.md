@@ -3,6 +3,10 @@
 A native Windows GUI that captures an output device through WASAPI loopback and
 streams one selected stereo channel to OpenAI `gpt-live-transcribe`.
 
+> **Rust conversion preview:** The native Rust rewrite lives alongside the
+> Python application on the conversion branch. The Python `run.cmd` remains the
+> established version until parity testing is complete.
+
 ## Start
 
 Open PowerShell and set your API key for that window:
@@ -31,6 +35,33 @@ start a fresh session again without reopening the app. Finalized turns are
 written to the `transcripts` folder. Each detected turn is also saved as a mono
 24 kHz WAV file in the session's `-audio` folder. Every completed transcript row
 has its own **Play** button for replaying that transmission.
+
+## Run the Rust preview
+
+The Rust version requires the Rust MSVC toolchain and Visual Studio C++ Build
+Tools. From PowerShell, run:
+
+```powershell
+.\run-rust.cmd
+```
+
+Start with the known vPilot virtual cable and highest accuracy:
+
+```powershell
+.\run-rust.cmd --device "CABLE In 16ch" --channel left --accuracy xhigh
+```
+
+List output devices without opening the GUI:
+
+```powershell
+cargo run -- --list-devices
+```
+
+Run the Rust test suite with:
+
+```powershell
+cargo test --all-targets
+```
 
 ## Useful options
 

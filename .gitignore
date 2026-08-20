@@ -5,6 +5,9 @@ __pycache__/
 *.py[cod]
 .uv-cache/
 
+# Rust build output
+target/
+
 # Generated transcripts and logs
 transcripts/
 *-audio/
