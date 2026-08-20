@@ -7,7 +7,7 @@ streams one selected stereo channel to OpenAI `gpt-live-transcribe`.
 > Python application on the conversion branch. The Python `run.cmd` remains the
 > established version until parity testing is complete.
 
-## Start
+## Run the Python version
 
 Open PowerShell and set your API key for that window:
 
@@ -36,14 +36,36 @@ written to the `transcripts` folder. Each detected turn is also saved as a mono
 24 kHz WAV file in the session's `-audio` folder. Every completed transcript row
 has its own **Play** button for replaying that transmission.
 
-## Run the Rust preview
+## Run the Rust version
 
-The Rust version requires the Rust MSVC toolchain and Visual Studio C++ Build
-Tools. From PowerShell, run:
+The prebuilt standalone executable is located at:
+
+```text
+dist\vatsim-live-transcriber-rust-0.1.0-windows-x64\vatsim-live-transcriber.exe
+```
+
+It runs on 64-bit Windows 10 or Windows 11. No Python installation, Rust
+toolchain, Visual Studio, or Visual C++ redistributable is required. Double-click
+the executable in File Explorer, or run it from PowerShell:
+
+```powershell
+& ".\dist\vatsim-live-transcriber-rust-0.1.0-windows-x64\vatsim-live-transcriber.exe"
+```
+
+The API key is kept in memory for the current run and is not written to disk.
+
+### Build and run from source
+
+Building the Rust version requires the Rust MSVC toolchain and Visual Studio C++
+Build Tools. From PowerShell, run:
 
 ```powershell
 .\run-rust.cmd
 ```
+
+This builds an optimized executable, updates the runnable copy under `dist`,
+and opens that exact `dist` executable. The file you test is therefore also the
+file ready to commit.
 
 Start with the known vPilot virtual cable and highest accuracy:
 
@@ -57,9 +79,17 @@ List output devices without opening the GUI:
 cargo run -- --list-devices
 ```
 
-Run the Rust test suite with:
+For a quick development build that does not update `dist`:
 
 ```powershell
+cargo run -- --device "CABLE In 16ch" --channel left --accuracy xhigh
+```
+
+Before updating the committed executable, format, lint, and test the source:
+
+```powershell
+cargo fmt --all
+cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 ```
 
