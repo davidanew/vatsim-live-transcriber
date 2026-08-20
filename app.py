@@ -550,6 +550,7 @@ def create_transcript_window(
         QMainWindow,
         QPushButton,
         QScrollArea,
+        QSizePolicy,
         QVBoxLayout,
         QWidget,
     )
@@ -566,15 +567,30 @@ def create_transcript_window(
             layout.setContentsMargins(14, 12, 12, 12)
             layout.setSpacing(12)
 
-            text_layout = QVBoxLayout()
+            # Put the labels in a shrinkable widget. Without this, QLabel's
+            # ever-growing size hint can make a progressive transcript retain
+            # its unwrapped width inside the row's horizontal layout.
+            self.text_container = QWidget()
+            self.text_container.setMinimumWidth(0)
+            self.text_container.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Preferred,
+            )
+            text_layout = QVBoxLayout(self.text_container)
+            text_layout.setContentsMargins(0, 0, 0, 0)
             text_layout.setSpacing(5)
-            layout.addLayout(text_layout, 1)
+            layout.addWidget(self.text_container, 1)
             self.original_label = QLabel()
             self.original_label.setTextFormat(Qt.TextFormat.PlainText)
             self.original_label.setTextInteractionFlags(
                 Qt.TextInteractionFlag.TextSelectableByMouse
             )
             self.original_label.setWordWrap(True)
+            self.original_label.setMinimumWidth(0)
+            self.original_label.setSizePolicy(
+                QSizePolicy.Policy.Ignored,
+                QSizePolicy.Policy.Preferred,
+            )
             self.original_label.setStyleSheet(
                 "color: #f3f4f6; font-family: Consolas; font-size: 14px;"
             )
@@ -585,6 +601,11 @@ def create_transcript_window(
                 Qt.TextInteractionFlag.TextSelectableByMouse
             )
             self.converted_label.setWordWrap(True)
+            self.converted_label.setMinimumWidth(0)
+            self.converted_label.setSizePolicy(
+                QSizePolicy.Policy.Ignored,
+                QSizePolicy.Policy.Preferred,
+            )
             self.converted_label.setStyleSheet(
                 "color: #22c55e; font-family: Consolas; font-size: 14px;"
             )
@@ -592,6 +613,10 @@ def create_transcript_window(
 
             self.play_button = QPushButton("Play")
             self.play_button.setEnabled(False)
+            self.play_button.setSizePolicy(
+                QSizePolicy.Policy.Fixed,
+                QSizePolicy.Policy.Fixed,
+            )
             self.play_button.clicked.connect(self._play)
             layout.addWidget(
                 self.play_button,
@@ -602,6 +627,11 @@ def create_transcript_window(
         def update_text(self, original: str, converted: str) -> None:
             self.original_label.setText(f"> {original}")
             self.converted_label.setText(converted)
+            # Recalculate height-for-width after each progressive update.
+            self.original_label.updateGeometry()
+            self.converted_label.updateGeometry()
+            self.text_container.updateGeometry()
+            self.updateGeometry()
 
         def finalize(
             self, original: str, converted: str, audio_path: str
@@ -670,6 +700,9 @@ def create_transcript_window(
 
             self.scroll_area = QScrollArea()
             self.scroll_area.setWidgetResizable(True)
+            self.scroll_area.setHorizontalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            )
             self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
             self.scroll_area.setStyleSheet(
                 "QScrollArea { background: #030712;"
