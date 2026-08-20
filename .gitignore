@@ -7,6 +7,12 @@ __pycache__/
 
 # Rust build output
 target/
+# Ignore generated distribution contents except Windows executables. Keeping
+# directories visible allows Git to reach and track an executable nested in a
+# versioned package folder without also adding ZIPs, documentation, or keywords.
+dist/**
+!dist/**/
+!dist/**/*.exe
 
 # Generated transcripts and logs
 transcripts/
